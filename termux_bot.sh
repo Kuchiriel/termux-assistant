@@ -1,251 +1,231 @@
 #!/data/data/com.termux/files/usr/bin/bash
-set -x
-source ~/.bashrc
-language="pt-br"
+# termux_bot.sh - assistente de voz/comandos do Termux.
+#
+# Como usar:
+#   ./termux_bot.sh "acende a lanterna"          # um comando, responde e sai
+#   ./termux_bot.sh --interactive                 # dialogo por voz (Termux:API)
+#   ./termux_bot.sh --backend opencode --model X "..."
+#   ./termux_bot.sh --stream "..."               # fala por sentenca enquanto gera
+#
+# Saida: texto da resposta no stdout (util para pipe); toasts/TTS sao opcionais.
 
-function assistant_message_box() {
-    messages=("How can I assist you today?" "What can I help you with?" "Tell me what you need." "What's is your need?" "How may I be of service?")
-    rand=$(($RANDOM % ${#messages[@]}))
-    echo "${messages[$rand]}" | trans -b -s auto -t "$language"
-}
+set -uo pipefail
 
-title="$(trans -b -s auto -t "$language" "Personal assistant")"
-hint="$(assistant_message_box)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$HERE/lib/common.sh"
 
-function detect_language() {
-    local text="$1"
-    trans -b -identify "$text" | awk '{print $1}'
-}
+ONCE=0
+INTERACTIVE=0
+STREAM=0
+QUIET=0
+TEXT=""
 
-function call_toast_and_tts() {
-    local text="$1"
-    local detected_lang
-    detected_lang=$(detect_language "$text")
-    if [[ $stream == true ]]; then
-        local cleaned_text
-        cleaned_text=$(echo "$text" | sed 's/[.,!?;:-]//g')
-        termux-tts-speak -l "$detected_lang" "$cleaned_text"
-    else
-        local response
-        response=$(trans -b -s auto -t "$language" "$text")
-        termux-toast "$response"
-        termux-tts-speak -l "$language" "$response"
-    fi
-}
+usage() {
+  cat <<'EOF'
+termux_bot.sh - assistente Termux (comandos locais + LLM)
 
-function call_llm() {
-    local prompt="$1"
-    local system_message="You are Dolphin a helpful assistant running in Termux on a Cellphone."
-    local chatml_template
-    chatml_template=$(
-        cat <<EOF
-${system_message}
-user
-${prompt}
-assistant
+USO
+  ./termux_bot.sh [opcoes] ["texto do comando"]
+
+OPCOES
+  --interactive        abre o dialogo de voz (termux-dialog) e repete ate "sair"
+  --once               processa o texto informado e sai (padrao se ha texto)
+  --backend <b>       opencode (padrao) | openai | ollama
+  --model <m>         modelo do backend
+  --lang <l>          idioma do TTS (padrao: pt-br)
+  --stream            fala por sentenca enquanto a resposta e gerada
+  --no-tts            desliga a fala (mantem o toast)
+  --quiet             nao imprime logs (so a resposta no stdout)
+  -h, --help          esta ajuda
+
+EXEMPLOS
+  ./termux_bot.sh "qual a temperatura da bateria?"
+  ./termux_bot.sh --backend opencode --model nvidia/minimaxai/minimax-m3.1-flash "explique o tunel SSL"
 EOF
-    )
-    local PROMPT
-    PROMPT=$(jq -nc --arg model "$model" --arg prompt "$chatml_template" --argjson stream "$stream" '{"model": $model, "prompt": $prompt, "stream": $stream}')
-    local endpoint="http://localhost:11434/api/generate"
-    local RESPONSE=""
-    if [[ "$stream" == true ]]; then
-        while IFS= read -r line; do
-            CHUNK=$(echo "$line" | jq -r '.response')
-            [[ "$CHUNK" == "null" || "$CHUNK" == "" ]] && break
-            RESPONSE="$RESPONSE$CHUNK"
-            for word in $CHUNK; do
-                call_toast_and_tts "$word"
-            done
-        done < <(curl -s "$endpoint" -d "$PROMPT")
-        termux-toast "$RESPONSE"
-    else
-        RESPONSE=$(curl -s "$endpoint" -d "$PROMPT" | jq -r '.response')
-        call_toast_and_tts "$RESPONSE"
-    fi
-    echo "$RESPONSE"
 }
 
-function call_openai() {
-    local prompt="$1"
-    local stream="$3"
-    local PROMPT=$(jq -nc --arg model "gpt-4" --arg prompt "$prompt" --arg max_tokens 200 --argjson stream "$stream" --argjson temperature 0.5 --argjson n 1 --argjson stop 'null' --argjson frequency_penalty 0 --argjson presence_penalty 0 '{"model": $model, "prompt": $prompt, "max_tokens": $max_tokens, "stream": $stream, "temperature": $temperature, "n": $n, "stop": $stop, "frequency_penalty": $frequency_penalty, "presence_penalty": $presence_penalty}')
-    local RESPONSE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --interactive) INTERACTIVE=1; shift ;;
+    --once) ONCE=1; shift ;;
+    --backend) TA_BACKEND="${2:-}"; shift 2 ;;
+    --model) TA_MODEL="${2:-}"; shift 2 ;;
+    --lang) TA_LANG="${2:-}"; shift 2 ;;
+    --stream) STREAM=1; TA_STREAM=true; shift ;;
+    --no-tts) TA_TTS=false; shift ;;
+    --quiet) QUIET=1; TA_LOG_LEVEL=error; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; TEXT="$*"; break ;;
+    -*) ta_log warn "opcao desconhecida: $1"; shift ;;
+    *) TEXT="${TEXT:+$TEXT }$1"; shift ;;
+  esac
+done
 
-    if [[ "$stream" == true ]]; then
-        while IFS= read -r line; do
-            CHUNK=$(echo "$line" | jq -r '.choices[].text')
-            [[ "$CHUNK" == "null" || "$CHUNK" == "" ]] && break
-            RESPONSE="$RESPONSE$CHUNK"
-            for word in $CHUNK; do
-                call_toast_and_tts "$word"
-            done
-        done < <(curl -s "$OPENAI_API_ENDPOINT" -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $OPENAI_API_KEY" -d "$PROMPT")
-        termux-toast "$RESPONSE"
-    else
-        RESPONSE=$(curl -s "$OPENAI_API_ENDPOINT" -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $OPENAI_API_KEY" -d "$PROMPT" | jq -r '.choices[].text')
-        call_toast_and_tts "$RESPONSE"
-    fi
-    echo "$RESPONSE"
+ta_load_config
+(( QUIET )) && TA_LOG_LEVEL=error
+[[ -n "${TA_OPENAI_API_KEY:-}" ]] && export OPENAI_API_KEY="$TA_OPENAI_API_KEY"
+
+# ---------- comandos locais ----------
+local_ip() {
+  ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}' | head -1
 }
 
-function call_commands() {
-    local speech="$1"
-    speech=$(trans -b -s auto -t en "$speech")
-    local model="$2"
-    local stream="$3"
+public_ip() {
+  # usa ipify (nao ifconfig.co) e nao vaza nada se o Tor estiver ativo
+  curl -fsS --max-time 12 https://api.ipify.org 2>/dev/null || echo "desconhecido"
+}
 
-    echo "Speech: $speech, Model: $model, Stream: $stream"
+cmd_battery() {
+  local st; st=$(termux-battery-status 2>/dev/null)
+  if [[ -z "$st" ]]; then echo "nao consegui ler a bateria"; return; fi
+  if ta_have jq; then
+    jq -r '"nivel \(.percentage)% | saude \(.health) | \(.plugged) | \(.temperature)C"' <<<"$st"
+  else
+    echo "$st"
+  fi
+}
 
-    case "$speech" in
-    *flashlight*)
-        if [[ "$speech" =~ "on" ]]; then
-            termux-torch on
-            call_toast_and_tts "Flashlight on"
-        else
-            termux-torch off
-            call_toast_and_tts "Flashlight off"
-        fi
-        ;;
-    *find* | *search*)
-        call_llm "$speech" "$model" "$stream"
-        ;;
-    *volume* | *sound*)
-        if [[ "$speech" =~ "up" || "$speech" =~ "raise" ]]; then
-            volume=$(termux-volume | jq '.[] | select(.stream == "system") | .volume + 1')
-            termux-volume system "$volume"
-            call_toast_and_tts "Raising the volume to $volume"
-        elif [[ "$speech" =~ "down" || "$speech" =~ "lower" ]]; then
-            volume=$(termux-volume | jq '.[] | select(.stream == "system") | .volume - 1')
-            termux-volume system "$volume"
-            call_toast_and_tts "Lowering the volume to $volume"
-        fi
-        ;;
-    *wifi*)
-        if [[ "$speech" =~ "on" ]]; then
-            termux-wifi-enable true
-            call_toast_and_tts "Enabling Wi-Fi"
-        else
-            termux-wifi-enable false
-            call_toast_and_tts "The Wi-Fi is now off, you may be unable to communicate with the bot API."
-        fi
-        ;;
-    *"list notifications"*)
-        notifications=$(termux-notification-list)
-        call_toast_and_tts "You have the following notifications: $notifications"
-        ;;
-    *"remove notification"*)
-        id=$(echo "$speech" | sed 's/remove notification //')
-        termux-notification-remove "$id"
-        call_toast_and_tts "Notification with ID $id has been removed."
-        ;;
+cmd_notifications() {
+  local n; n=$(termux-notification-list 2>/dev/null)
+  [[ -z "$n" ]] && { echo "nenhuma notificacao"; return; }
+  if ta_have jq; then
+    local count; count=$(jq 'length' <<<"$n" 2>/dev/null || echo 0)
+    echo "$count notificacao(oes):"
+    jq -r '.[0:5][] | "  - \(.title // "sem titulo"): \((.content // "")[0:60])"' <<<"$n" 2>/dev/null
+  else
+    echo "$n"
+  fi
+}
+
+cmd_location() {
+  local loc
+  loc=$(timeout 25 termux-location -a 2>/dev/null || true)
+  [[ -z "$loc" ]] && { echo "nao consegui obter a localizacao (sem permissao ou sem GPS)"; return; }
+  if ta_have jq; then
+    local lat lon acc addr
+    lat=$(jq -r '.latitude' <<<"$loc" 2>/dev/null)
+    lon=$(jq -r '.longitude' <<<"$loc" 2>/dev/null)
+    acc=$(jq -r '.accuracy' <<<"$loc" 2>/dev/null)
+    addr=$(curl -fsS --max-time 12 -A "termux-assistant" \
+      "https://nominatim.openstreetmap.org/reverse?lat=$lat&lon=$lon&format=json" 2>/dev/null \
+      | jq -r '[.address.road, .address.suburb, .address.city, .address.state] | map(select(. != null)) | join(", ")' 2>/dev/null)
+    echo "você está em ${addr:-lat $lat, lon $lon} (precisão ${acc:-?})"
+  else
+    echo "$loc"
+  fi
+}
+
+# run_local <texto> -> imprime a resposta local e retorna 0 se tratou
+run_local() {
+  local speech="$1"
+  case "${speech,,}" in
+    *lanterna*|*torch*|*flashlight*)
+      if [[ "${speech,,}" =~ (off|desliga|apaga|desligar) ]]; then termux-torch off 2>/dev/null; echo "lanterna desligada";
+      else termux-torch on 2>/dev/null; echo "lanterna ligada"; fi
+      return 0 ;;
+    *volume*)
+      # a API do Termux exige NUMERO: le o atual, soma/subtrai e grava.
+      local cur new
+      cur=$(termux-volume 2>/dev/null | jq -r '[.[] | select(.stream == "music") | .volume][0] // 0' 2>/dev/null || echo 0)
+      [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+      if [[ "${speech,,}" =~ (aumenta|sobe|mais|up|raise|cima) ]]; then
+        new=$((cur + 1)); [[ $new -gt 15 ]] && new=15
+      elif [[ "${speech,,}" =~ (diminui|baixa|menos|down|lower|abaixo) ]]; then
+        new=$((cur - 1)); [[ $new -lt 0 ]] && new=0
+      else
+        echo "quer aumentar ou diminuir o volume?"; return 0
+      fi
+      termux-volume music "$new" >/dev/null 2>&1
+      echo "volume da mídia: $new"
+      return 0 ;;
+    *bateria*|*battery*)
+      cmd_battery; return 0 ;;
+    *notifica*)
+      cmd_notifications; return 0 ;;
+    *localiza*|*"onde eu"*|*location*)
+      cmd_location; return 0 ;;
+    *"meu ip"*|*"ip local"*|*"ip publico"*|*"endereco ip"*)
+      if [[ "${speech,,}" =~ (local|priv) ]]; then echo "seu IP local e $(local_ip)";
+      elif [[ "${speech,,}" =~ (public|global|externo) ]]; then echo "seu IP publico e $(public_ip)";
+      else echo "IP local: $(local_ip) | IP publico: $(public_ip)"; fi
+      return 0 ;;
     *toast*)
-        message=$(echo "$speech" | sed 's/toast //')
-        termux-toast "$message"
-        ;;
-    *IP*)
-        if [[ "$speech" =~ "local" ]]; then
-            call_toast_and_tts "The device local IP address is: $(ifconfig | grep broadcast | awk '{print $2}')"
-        elif [[ "$speech" =~ "Global" || "$speech" =~ "valid" ]]; then
-            call_toast_and_tts "The device global IP address is: $(wget -qO- -4 ifconfig.co)"
-        else
-            call_toast_and_tts "The device local IP address is: $(ifconfig | grep broadcast | awk '{print $2}') and the Global IP address is: $(wget -qO- -4 ifconfig.co)"
-        fi
-        ;;
-    *battery*)
-        if [[ "$speech" =~ "status" || "$speech" =~ "how much" || "$speech" =~ "level" ]]; then
-            status=$(termux-battery-status)
-            health=$(echo "$status" | jq -c '.health')
-            level=$(echo "$status" | jq -c '.percentage')
-            plugged=$(echo "$status" | jq -c '.plugged')
-            temperature=$(echo "$status" | jq -c '.temperature')
-            call_toast_and_tts "Your battery level is $level percent, and the battery health is $health, the phone is currently $plugged and the temperature is $temperature degrees Celsius"
-        fi
-        ;;
-    *screen* | *brightness* | *bright*)
-        if [[ "$speech" =~ "too" || "$speech" =~ "much" || "$speech" =~ "very" ]]; then
-            if [[ "$speech" =~ "dark" || "$speech" =~ "black" ]]; then
-                call_toast_and_tts "Your screen brightness is now at maximum"
-                termux-brightness 255
-            else
-                call_toast_and_tts "Your screen brightness is now at minimum"
-                termux-brightness 0
-            fi
-        fi
-        ;;
-    *cell* | *telephony*)
-        call_llm "Short describe the cell info $(termux-telephony-cellinfo)" "$model" "$stream"
-        ;;
-    *copy* | *clipboard*)
-        text=$(echo "$speech" | sed 's/copy //')
-        termux-clipboard-set "$text"
-        call_toast_and_tts "I have copied $text to clipboard"
-        ;;
-    *"take a photo"* | *"take a picture"*)
-        file=$(termux-camera-photo -c 0 --jpeg /sdcard/photo.jpg)
-        call_toast_and_tts "I have taken a photo and saved it to $file"
-        ;;
-    *"show notification"*)
-        message=$(echo "$speech" | sed 's/show notification //')
-        termux-notification --title "My Personal Assistant" --content "$message"
-        call_toast_and_tts "I have shown a notification with message: $message"
-        ;;
-    *vibrate*)
-        termux-vibrate -d 1000
-        call_toast_and_tts "I have vibrated the device for 1 second"
-        ;;
-    *call*)
-        number=$(echo "$speech" | sed 's/[a-zA-Z ]*//g')
-        termux-telephony-call "$number"
-        call_toast_and_tts "I am making a call to $number"
-        ;;
-    *location*)
-        location=$(termux-location)
-        if [[ -n "$location" ]]; then
-            latitude=$(echo "$location" | jq '.latitude')
-            longitude=$(echo "$location" | jq '.longitude')
-            accuracy=$(echo "$location" | jq '.accuracy')
-            location=$(curl -s "https://nominatim.openstreetmap.org/reverse?lat=$latitude&lon=$longitude&format=json" | jq '.address.road, .address.state, .address.country')
-            call_toast_and_tts "Your location is $location, the accuracy for this information is $accuracy"
-        else
-            call_toast_and_tts "Sorry, I couldn't retrieve your location."
-        fi
-        ;;
-    *play* | *pause* | *next* | *previous*)
-        command=""
-        if [[ "$speech" =~ "play" ]]; then
-            command="play"
-        elif [[ "$speech" =~ "pause" ]]; then
-            command="pause"
-        elif [[ "$speech" =~ "next" ]]; then
-            command="next"
-        elif [[ "$speech" =~ "previous" ]]; then
-            command="previous"
-        fi
-        termux-media-player "$command"
-        call_llm "$command" "$model" "$stream"
-        ;;
-    *infrared*)
-        signal=$(echo "$speech" | sed 's/.*transmit //g')
-        termux-infrared-transmit "$signal"
-        call_toast_and_tts "Transmitted infrared signal: $signal"
-        ;;
-    *)
-        call_llm "$speech" "$model" "$stream"
-        ;;
-    esac
+      local msg="${speech#*toast }"
+      ta_toast "$msg"; echo "toast: $msg"; return 0 ;;
+    *copi*|*clipboard*)
+      local msg="${speech#*copi }"
+      termux-clipboard-set "$msg" 2>/dev/null && echo "copiei para a area de transferencia: $msg"; return 0 ;;
+    *vibr*)
+      termux-vibrate -d 1000 2>/dev/null; echo "vibrando"; return 0 ;;
+    *sair*|*tchau*|*bye*|*exit*)
+      echo "ate mais"; return 0 ;;
+  esac
+  return 1
 }
 
-model=${2,,}
-[[ -z "$2" ]] && model="tinydolphin:latest"
-stream=${3,,}
-[[ -z "$3" ]] && stream=false
-speech="$1"
+# ---------- geracao ----------
+ask_llm() {
+  local prompt="$1" out=""
+  if (( STREAM )); then
+    # fala por sentenca: divide em pedacos e fala cada um (nada de toast por palavra)
+    out=$(ta_generate "$prompt")
+    local acc=""
+    while IFS= read -r s; do
+      acc="$acc $s"
+      local full; full=$(printf '%s' "$acc" | tr '\n' ' ')
+      if [[ ${#full} -ge 120 || "$s" =~ [.!?]$ ]]; then
+        ta_toast "$full"; ta_speak "$full"; acc=""
+      fi
+    done < <(ta_sentences "$out")
+    [[ -n "$acc" ]] && { ta_toast "$acc"; ta_speak "$acc"; }
+  else
+    out=$(ta_generate "$prompt")
+  fi
+  [[ -z "$out" ]] && out="(sem resposta do backend $TA_BACKEND)"
+  printf '%s\n' "$out"
+}
 
-if [[ -n "$1" ]]; then
-    call_commands "$speech" "$model" "$stream"
-else
-    call_commands "$speech" "$model" "$stream"
-    termux-tts-speak "$hint"
-    speech=$(termux-dialog speech -i "$hint" -t "$title" | jq '.text')
+handle() {
+  local speech="$1"
+  [[ -z "${speech// }" ]] && { echo "nao entendi"; return; }
+  local resp
+  if resp=$(run_local "$speech"); then
+    printf '%s\n' "$resp"
+    ta_toast "$(printf '%s' "$resp" | head -c 200)"
+    ta_speak "$resp"
+    return
+  fi
+  local system="Voce e um assistente no Termux, em um celular Android. Responda em portugues do Brasil, de forma curta e direta (maximo 3 frases), sem markdown."
+  resp=$(ask_llm "$system
+
+Usuario: $speech")
+  printf '%s\n' "$resp"
+  ta_toast "$(printf '%s' "$resp" | head -c 200)"
+  ta_speak "$resp"
+}
+
+# ---------- modos ----------
+if (( INTERACTIVE )); then
+  ta_need termux-dialog "Termux:API nao instalado (pkg install termux-api)"
+  title="Assistente Termux"
+  hint="Como posso ajudar?"
+  ta_speak "$hint"
+  while true; do
+    raw=$(termux-dialog speech -i "$hint" -t "$title" 2>/dev/null)
+    speech=$(ta_have jq && jq -r '.text // empty' <<<"$raw" 2>/dev/null || echo "$raw")
+    [[ -z "$speech" ]] && break
+    handle "$speech"
+    case "${speech,,}" in
+      *sair*|*tchau*|*bye*|*exit*) break ;;
+    esac
+  done
+  exit 0
 fi
+
+if [[ -z "$TEXT" ]]; then
+  usage
+  exit 2
+fi
+
+handle "$TEXT"
