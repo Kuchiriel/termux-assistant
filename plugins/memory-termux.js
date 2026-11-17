@@ -233,7 +233,7 @@ function fallbackSummary(messages) {
   const head = lines.slice(-40).join("\n");
   return [
     "## Objective",
-    "Continuar o trabalho da frota (Crouton Alpha / Termux). O resumo abaixo e automatico",
+    "Continuar o trabalho da frota (TAB / Termux). O resumo abaixo e automatico",
     "e preserva o essencial do transcript; a memoria da frota esta em ~/ai-mesh/memory/episodic.",
     "",
     "## Transcript (tail)",

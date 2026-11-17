@@ -25,7 +25,7 @@ import time
 
 REPO = os.environ.get("BUS_REPO", "Kuchiriel/mt5")
 ISSUE = os.environ.get("BUS_ISSUE", "12")
-AGENT = os.environ.get("BUS_AGENT", "crouton-alpha")
+AGENT = os.environ.get("BUS_AGENT", "tab")
 LANE = os.environ.get("BUS_LANE", "termux/vpnsec")
 GH_TIMEOUT = int(os.environ.get("BUS_GH_TIMEOUT", "90"))
 GH_READ_RETRIES = int(os.environ.get("BUS_GH_READ_RETRIES", "3"))

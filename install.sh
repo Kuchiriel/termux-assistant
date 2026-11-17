@@ -37,7 +37,9 @@ link_shortcut() {
   local src="$TA_DIR/widgets/$wname" dst="$SHORTCUTS/$wname"
   if [ "$DRY" = "1" ]; then printf 'dry-run atalho: %s\n' "$dst"; return 0; fi
   mkdir -p "$SHORTCUTS/tasks"; chmod 700 "$SHORTCUTS" "$SHORTCUTS/tasks"
-  ln -sfn "$src" "$dst"
+  # Termux:Widget ignora symlinks para fora de ~/.shortcuts — copia arquivo real.
+  [ -L "$dst" ] && mv "$dst" "$dst.ta-symlink" 2>/dev/null || true
+  cp "$src" "$dst" 2>/dev/null && chmod 755 "$dst"
 }
 
 say "instalando termux-assistant de $REPO (dry=$DRY)"

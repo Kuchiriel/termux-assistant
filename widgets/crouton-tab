@@ -1,0 +1,15 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-tab — TAB: pergunta -> RAG offline + gate, resposta PT, sem rede.
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+R="$HOME/projects/termux-assistant/blackout/tab_rag.py"
+[ -f "$R" ] || R="$HOME/.local/share/termux-assistant/blackout/tab_rag.py"
+q="${TAB_QUERY:-}"
+if [ -z "$q" ]; then
+  q="$(termux-dialog text -t "TAB — sobrevivencia" -i "Ex: purificar agua" | python3 -c 'import json,sys;print((json.load(sys.stdin).get("text") or "").strip())')"
+fi
+[ -z "$q" ] && exit 0
+out="$(timeout 280 python3 "$R" "$q" 2>&1)"
+termux-vibrate -d 40 2>/dev/null || true
+if [ "${TAB_STDOUT:-0}" = "1" ]; then printf '%s\n' "$out"; exit 0; fi
+termux-dialog text -t "TAB: $q" -i "$out" >/dev/null 2>&1 || printf '%s\n' "$out" | termux-toast -g middle

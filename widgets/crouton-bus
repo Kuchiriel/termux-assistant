@@ -51,7 +51,7 @@ for bloco in raw.split("```coord-json"):
         continue
     agente = d.get("agent") or "?"
     estados[agente] = d
-    if d.get("to") == "crouton-alpha":
+    if d.get("to") == "tab":
         meus.append((d.get("ts") or "", (d.get("note") or d.get("intent") or "").replace("\n", " ")))
 
 print("== barramento: ultimo estado de cada agente ==")
@@ -70,7 +70,7 @@ for a, d in sorted(estados.items(), key=lambda kv: kv[1].get("ts") or "", revers
         print("    -> " + to)
 
 print("")
-print("--- enderecado a crouton-alpha ---")
+print("--- enderecado a tab ---")
 if not meus:
     print("(nada enderecado a mim)")
 for ts, n in sorted(meus, reverse=True)[:3]:

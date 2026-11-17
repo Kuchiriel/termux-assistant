@@ -72,7 +72,7 @@ def notificar(titulo, texto, nid, botoes=(), prio="max"):
     return rc == 0
 
 
-def tocar(texto="", titulo="Crouton Alpha"):
+def tocar(texto="", titulo="TAB"):
     rodar(["termux-toast", "-g", "middle", texto[:120]], timeout=10)
     rodar(["termux-vibrate", "-d", "180", "-f"], timeout=10)
 
@@ -305,7 +305,7 @@ def main(argv):
         epilog="ex.: decidir --titulo Frota 'Publicar o brief?' Sim Nao")
     ap.add_argument("pergunta", nargs="?", help="a pergunta (curta)")
     ap.add_argument("opcoes", nargs="*", help="1 a 3 opcoes (= botoes)")
-    ap.add_argument("--titulo", default="Crouton Alpha", help="titulo da notificacao")
+    ap.add_argument("--titulo", default="TAB", help="titulo da notificacao")
     ap.add_argument("--acao-1", dest="acao1", help="comando se escolher a opcao 1")
     ap.add_argument("--acao-2", dest="acao2", help="comando se escolher a opcao 2")
     ap.add_argument("--acao-3", dest="acao3", help="comando se escolher a opcao 3")

@@ -1,5 +1,5 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# auto-wake — fila de auto-tarefas do Crouton Alpha (celular).
+# auto-wake — fila de auto-tarefas do TAB (celular).
 #
 # COMO FUNCIONA (visivel NO TUI, nada de background):
 #   1. o agente enfileira a proxima tarefa:  auto-wake enqueue "tarefa"

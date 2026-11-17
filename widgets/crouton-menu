@@ -1,5 +1,5 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# crouton-menu - menu principal (Termux:Widget) para o setup do Crouton Alpha.
+# crouton-menu - menu principal (Termux:Widget) para o setup do TAB.
 # Roda a acao escolhida e mostra o resultado. Sem acao: mostra o estado atual.
 #
 # Como usar: adicione um widget do Termux:Widget -> "crouton-menu".
@@ -19,7 +19,7 @@ exit_tor() { proxychains4 -f "$HOME/.proxychains.conf" curl -s -m 20 https://che
 
 # ---------- estado resumido ----------
 estado() {
-  say "== Crouton Alpha =="
+  say "== TAB =="
   if tor_on; then
     say "Tor: LIGADO  $(exit_tor | head -c 60)"
   else
@@ -82,8 +82,8 @@ if command -v termux-dialog >/dev/null 2>&1; then
     "Sair"
   )
   IFS='|' read -r -a itens <<<"$(IFS='|'; echo "${itens[*]}")"
-  resp=$(termux-dialog -t "Crouton Alpha" -i "Escolha uma acao" -f "${itens[@]}" 2>/dev/null | jq -r '.text // .index // empty' 2>/dev/null)
-  idx=$(termux-dialog -t "Crouton Alpha" -i "Escolha" -f "${itens[@]}" 2>/dev/null | jq -r '.index // empty' 2>/dev/null)
+  resp=$(termux-dialog -t "TAB" -i "Escolha uma acao" -f "${itens[@]}" 2>/dev/null | jq -r '.text // .index // empty' 2>/dev/null)
+  idx=$(termux-dialog -t "TAB" -i "Escolha" -f "${itens[@]}" 2>/dev/null | jq -r '.index // empty' 2>/dev/null)
   if [[ -n "$idx" ]]; then
     case "$idx" in
       0) acao 1 ;; 1) acao 2 ;; 2) acao 9 ;; 3) acao 10 ;; 4) acao 11 ;;

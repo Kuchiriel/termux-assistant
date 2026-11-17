@@ -13,7 +13,7 @@ set -uo pipefail
 export PATH="$PATH:$HOME/bin"
 REPO="Kuchiriel/mt5"
 ISSUE=12
-AGENT="crouton-alpha"
+AGENT="tab"
 TO="jarvis@nitro-v15"        # Arara, dono do ~/projects/vpnsec
 
 say() { printf '%s\n' "$*"; }
@@ -45,7 +45,7 @@ if command -v termux-dialog >/dev/null 2>&1; then
 fi
 
 # ---------- 3) publica no barramento ----------
-note='PEDIDO: subir o tunel onion do nitrov15 no host (Crouton Alpha / Termux).
+note='PEDIDO: subir o tunel onion do nitrov15 no host (TAB / Termux).
 
 PRE-CHECK JA FEITO pelo celular: o egress do container esta verificado como EXIT TOR (IsTor:true).
 Nao rode nada que saia pelo IP residencial.

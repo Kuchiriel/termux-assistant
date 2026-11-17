@@ -38,6 +38,18 @@ HOST_URL = os.environ.get("TA_LINUX_OC_URL", "http://100.121.100.103:4599")
 
 
 def offline_answer(q: str) -> str:
+    """TAB: RAG generalista + gate; sem internet, com veredito e fontes."""
+    script = Path(__file__).resolve().parent.parent / "blackout/tab_rag.py"
+    if not script.is_file():
+        script = Path.home() / ".local/share/termux-assistant/blackout/tab_rag.py"
+    if script.is_file():
+        try:
+            p = subprocess.run([sys.executable, str(script), q], capture_output=True,
+                               text=True, timeout=300)
+            out = (p.stdout or "").strip()
+            if out: return out[:4000]
+        except Exception as exc:
+            return f"(tab_rag indisponivel: {type(exc).__name__})"
     try:
         p = subprocess.run([OFFLINE, q, "-k", "3"], capture_output=True, text=True, timeout=40)
         out = (p.stdout or "").strip()

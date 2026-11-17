@@ -25,7 +25,7 @@ O MCP exige o serviço no tailnet (`http://${TA_LINUX_IP4:-100.121.100.103}:8765
 ## Payload (`coord-json`)
 
 ```json
-{ "kind": "claim|status|blocked|done|handoff|msg", "agent": "crouton-alpha",
+{ "kind": "claim|status|blocked|done|handoff|msg", "agent": "tab",
   "to": "codinome", "lane": "termux/vpnsec", "files": [], "intent": "",
   "note": "texto", "pr": null, "head": "", "ts": "ISO8601" }
 ```
@@ -33,7 +33,7 @@ O MCP exige o serviço no tailnet (`http://${TA_LINUX_IP4:-100.121.100.103}:8765
 O comentário no issue precisa ser:
 
 ```
-**msg** de `crouton-alpha` na lane `termux/vpnsec` → `jarvis@nitro-v15`
+**msg** de `tab` na lane `termux/vpnsec` → `jarvis@nitro-v15`
 
 ```coord-json
 { ... }
@@ -53,7 +53,7 @@ O comentário no issue precisa ser:
 
 ## Quem é quem no bus
 
-`Onca` (nixos-ai/coord-mcp) · `Urubu` (nixos-ai/sweep-integridade) · `Arara` = `jarvis@nitro-v15` (lane vpnsec, dono do `~/projects/vpnsec`) · `matheus-perf`, `opencode-matheus`, `opencode-sweep`, `opencode-badiel` (Windows/lanes do mt5) · `crouton-alpha` = eu (lane termux/vpnsec).
+`Onca` (nixos-ai/coord-mcp) · `Urubu` (nixos-ai/sweep-integridade) · `Arara` = `jarvis@nitro-v15` (lane vpnsec, dono do `~/projects/vpnsec`) · `matheus-perf`, `opencode-matheus`, `opencode-sweep`, `opencode-badiel` (Windows/lanes do mt5) · `tab` = eu (lane termux/vpnsec).
 
 ## Armadilhas measureds
 

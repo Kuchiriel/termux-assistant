@@ -23,7 +23,7 @@ set -uo pipefail
 export PATH="$HOME/bin:$PREFIX/bin:$PATH"
 
 MSG=""
-TITLE="Crouton Alpha"
+TITLE="TAB"
 PRIO="high"
 USE_TG=0
 USE_NATIVE=1
@@ -51,7 +51,7 @@ done
 # id estavel: mesmo titulo = mesmo slot (atualiza); mensagem pontual sem titulo =
 # hash do texto (avisos diferentes nao se sobrescrevem).
 if [ -z "$NOTIF_ID" ] && [ "$FORCE_NEW" = "0" ]; then
-  if [ "$TITLE" = "Crouton Alpha" ]; then
+  if [ "$TITLE" = "TAB" ]; then
     _h=$(printf '%s' "$MSG" | sha256sum | cut -c1-10)
     NOTIF_ID="crouton-msg-$_h"
   else

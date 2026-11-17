@@ -48,7 +48,13 @@ if local_match; then
   R=$(cd "$HOME" && timeout 20 "$HOME/projects/termux-assistant/termux_bot.sh" --quiet --no-tts "$Q" 2>/dev/null)
 elif offline_match; then
   ROUTE="offline"
-  R=$(timeout 25 "$HOME/bin/offline" "$Q" -k 2 2>/dev/null | head -c 1200)
+  TABRAG="$HOME/projects/termux-assistant/blackout/tab_rag.py"
+  [ -f "$TABRAG" ] || TABRAG="$HOME/.local/share/termux-assistant/blackout/tab_rag.py"
+  if [ -f "$TABRAG" ]; then
+    R=$(timeout 280 python3 "$TABRAG" "$Q" 2>/dev/null | head -c 1600)
+  else
+    R=$(timeout 25 "$HOME/bin/offline" "$Q" -k 2 2>/dev/null | head -c 1200)
+  fi
 elif house_match; then
   ROUTE="house"
   R=$(timeout 45 "$HOME/bin/house" status 2>/dev/null | head -c 900)

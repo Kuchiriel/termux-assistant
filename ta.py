@@ -23,8 +23,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent
 HOME = Path.home()
+_repos = [Path(__file__).resolve().parent,
+          HOME / "projects/termux-assistant",
+          HOME / ".local/share/termux-assistant"]
+REPO = next((p for p in _repos if (p / "README.md").is_file()), _repos[0])
 STATE = HOME / ".local/state/termux-assistant"
 ENVFILE = HOME / ".config/termux-assistant/.env"
 
@@ -119,6 +122,13 @@ def restore(a):
     return rc
 
 
+def slm(a):
+    script = REPO / "bin/tab-slm"
+    rc, out = run([str(script), *a.rest], 300)
+    print(out, end="")
+    return rc
+
+
 def secrets(_a):
     script = REPO / "tests/scan-secrets.py"
     rc, out = run([sys.executable, str(script), str(REPO)], 60)
@@ -150,13 +160,21 @@ def main(argv=None):
         ("widgets", widgets, "instalar/refrescar atalhos"),
         ("backup", backup, "backup completo"),
         ("restore", restore, "restaurar backup"),
+        ("slm", slm, "pergunta one-shot ao SLM local"),
         ("secrets", secrets, "auditar segredos"),
         ("status", status, "lab + casa"),
     ]:
         q = sub.add_parser(name, help=helptext)
         q.set_defaults(fn=fn)
+        if name in ("slm", "chat", "offline", "linux"):
+            q.add_argument("rest_args", nargs="*", help=argparse.SUPPRESS)
     a = p.parse_args(argv)
-    a.rest = argv[argv.index(a.cmd) + 1:] if a.cmd and argv and a.cmd in argv else []
+    if getattr(a, "rest_args", None):
+        a.rest = a.rest_args
+    elif a.cmd and argv and argv[0] == a.cmd:
+        a.rest = argv[1:]
+    else:
+        a.rest = argv[argv.index(a.cmd) + 1:] if a.cmd and argv and a.cmd in argv else []
     if not getattr(a, "fn", None):
         print("termux-assistant — um comando para a casa\n")
         print("  ta doctor | chat | offline | linux | api | widgets | backup | restore | secrets | status")

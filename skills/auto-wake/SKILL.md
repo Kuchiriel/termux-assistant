@@ -40,7 +40,7 @@ Regras implementadas:
 
 - só acorda se houver **tarefa na fila** (fila vazia = sessão fica ociosa de verdade);
 - orçamento: **máx. 12 wakes/hora** + gap mínimo de 3 min;
-- **não** mexe na sessão da noite (`Turno da noite - Crouton Alpha`, que tem ciclo próprio);
+- **não** mexe na sessão da noite (`Turno da noite - TAB`, que tem ciclo próprio);
 - o prompt admite as regras: medir antes de agir, não apagar nada, não reiniciar o opencode,
   segredos fora do bus/repo, e **enfileirar a próxima tarefa** ao terminar.
 

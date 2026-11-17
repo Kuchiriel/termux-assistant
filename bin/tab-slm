@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# tab-slm — one-shot: carrega modelo, responde, SAi (sem servidor, sem RAM presa).
+set -uo pipefail
+for f in "$HOME/.config/termux-assistant/.env"; do [ -r "$f" ] && { set -a; . "$f"; set +a; }; done
+M="${TA_SLM_MODEL:-$HOME/models/slm/gemma-3-1b-it-Q4_K_M.gguf}"
+C="${TA_LLAMA_CLI:-llama-cli}"
+T="${TA_SLM_THREADS:-4}"
+TB="${TA_SLM_THREADS_BATCH:-8}"
+CTX="${TA_SLM_CTX:-2048}"
+N="${TA_SLM_N:-220}"
+Q="${*:-}"
+[ -z "$Q" ] && { echo "uso: tab-slm 'pergunta'"; exit 2; }
+[ -f "$M" ] || { echo "modelo ausente: $M"; exit 1; }
+T0=$(date +%s%3N)
+timeout 240 "$C" -m "$M" -p "$Q" --ctx-size "$CTX" -st -n "$N" \
+  --no-warmup -t "$T" -tb "$TB" --no-display-prompt 2>/dev/null \
+  | sed -n '/^> /,$p' | tail -n +2 | sed '/\[ Prompt:/,$d' | sed '/^$/d'
+T1=$(date +%s%3N)
+printf '\n[one-shot %sms; modelo descarregado ao sair]\n' "$((T1-T0))"
