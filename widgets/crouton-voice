@@ -1,0 +1,11 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# widget: voz (Termux:API STT) + roteador + TTS em pt-BR
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+raw=$(termux-dialog speech -i "Fale a pergunta" -t "Crouton" 2>/dev/null)
+q=$(printf '%s' "$raw" | jq -r '.text // empty' 2>/dev/null)
+[ -z "$q" ] && { printf '(sem voz)'; exit 0; }
+printf 'Q: %s\n\n' "$q"
+r=$(timeout 130 ~/bin/assistant-router --route "$q" 2>/dev/null | head -c 900)
+printf '%s\n' "$r"
+termux-tts-speak -l pt-br "$(printf '%s' "$r" | sed 's/[.,!?;:]/ /g' | head -c 400)" >/dev/null 2>&1 || true

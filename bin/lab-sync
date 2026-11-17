@@ -1,0 +1,95 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# lab-sync — paridade entre o CELULAR (~/work/hub) e o LINUX (repo canônico).
+#
+# Por que existe: o laboratório nasceu com arquivos dos dois lados e a
+# pergunta "o que tem aqui que não tem lá?" só se respondia por memória. Aqui
+# a resposta é medida por hash, não lembrada.
+#
+# Uso:
+#   lab-sync check    compara o espelho local com o canônico (só relatório)
+#   lab-sync pull     baixa os canônicos para ~/work/hub (não apaga locais)
+#   lab-sync local    lista o que existe SÓ no celular (candidato a subir)
+#   lab-sync host     lista o que existe SÓ no host
+set -uo pipefail
+
+HOST='${TA_LINUX_USER:-nixos}@${TA_LINUX_HOST6:-fd7a:115c:a1e0::7f01:64bd}'
+HOST_SCP='${TA_LINUX_USER:-nixos}@[${TA_LINUX_HOST6:-fd7a:115c:a1e0::7f01:64bd}]'
+REPO='projects/nixos-ai'
+LOCAL="$HOME/work/hub"
+
+# os arquivos que COMPÕEM o laboratório (não é o repo inteiro)
+ARQS=(
+    scripts/lab.sh
+    scripts/ab_loop.sh
+    scripts/llm-swap.sh
+    scripts/restart-ab.sh
+    scripts/dungeon-checker.py
+    scripts/dungeon-checker-l1.py
+    scripts/dungeon-checker-l2.py
+    scripts/prova_checkers.py
+    scripts/agent-hub.mjs
+    scripts/agent-hub-ui.html
+    modules/ai/jarvis/src/nightwatch/dungeon.py
+    docs/lab/README.md
+    docs/lab/HANDOFF.md
+)
+
+check() {
+    local dif=0
+    echo "arquivo                                        local     host      estado"
+    for a in "${ARQS[@]}"; do
+        local base l h
+        base=$(basename "$a")
+        l=$(sha256sum "$LOCAL/$base" 2>/dev/null | cut -c1-8)
+        h=$(timeout 30 ssh -6 -o ConnectTimeout=8 -o BatchMode=yes "$HOST" \
+            "sha256sum ~/$REPO/$a 2>/dev/null | cut -c1-8" 2>/dev/null)
+        if [ -z "$l" ]; then
+            printf '%-46s %-9s %-9s %s\n' "$base" "--" "${h:-?}" "SÓ NO HOST"
+            dif=$((dif+1))
+        elif [ "$l" = "$h" ]; then
+            printf '%-46s %-9s %-9s %s\n' "$base" "$l" "$h" "igual"
+        else
+            printf '%-46s %-9s %-9s %s\n' "$base" "$l" "${h:-?}" "DIFERENTE"
+            dif=$((dif+1))
+        fi
+    done
+    echo
+    if [ "$dif" -eq 0 ]; then echo "paridade OK (${#ARQS[@]} arquivos)"; else echo "$dif arquivo(s) fora de sincronia — rode: lab-sync pull"; fi
+    return $dif
+}
+
+pull() {
+    mkdir -p "$LOCAL"
+    for a in "${ARQS[@]}"; do
+        local base
+        base=$(basename "$a")
+        timeout 60 scp -6 -o ConnectTimeout=8 -q "$HOST_SCP:~/$REPO/$a" "$LOCAL/$base" 2>/dev/null \
+            && echo "ok  $base" || echo "ERRO $a"
+    done
+    echo "(espelho em $LOCAL — o canônico continua sendo o repo no host)"
+}
+
+apenas_local() {
+    echo "arquivos em $LOCAL que NÃO estão no conjunto canônico:"
+    for f in "$LOCAL"/*; do
+        local b; b=$(basename "$f")
+        local achou=0
+        for a in "${ARQS[@]}"; do [ "$(basename "$a")" = "$b" ] && achou=1; done
+        [ "$achou" -eq 0 ] && echo "  $b"
+    done
+}
+
+apenas_host() {
+    echo "canônicos que faltam no espelho local:"
+    for a in "${ARQS[@]}"; do
+        [ -f "$LOCAL/$(basename "$a")" ] || echo "  $a"
+    done
+}
+
+case "${1:-check}" in
+    check) shift || true; check ;;
+    pull) pull ;;
+    local) apenas_local ;;
+    host) apenas_host ;;
+    *) echo "uso: lab-sync check|pull|local|host" >&2; exit 2 ;;
+esac

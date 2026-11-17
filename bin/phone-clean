@@ -1,0 +1,415 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""phone-clean - organiza e limpa o armazenamento do Android a partir do Termux.
+
+    phone-clean --report       # relatorio por categoria (padrao, nao apaga nada)
+    phone-clean --safe         # apaga SO o lixo inequivoco (ver lista abaixo)
+    phone-clean --duplicates   # lista arquivos duplicados (por hash) - nao apaga
+    phone-clean --big [MB]     # lista os arquivos maiores que MB (padrao 100)
+    phone-clean --old [dias]    # lista arquivos com mais de N dias (padrao 365)
+
+NUNCA apaga: bancos de apps (Databases/), DCIM (camera), Documents, Music,
+Movies, Pictures, backups do WhatsApp, nem a media ja salva no chat.
+"""
+
+import os, sys, hashlib, time, shutil, subprocess, json
+from collections import defaultdict
+
+SD = "/storage/emulated/0"
+HOME = os.path.expanduser("~")
+WA = f"{SD}/Android/media/com.whatsapp.w4b/WhatsApp Business"
+
+# ---------------------------------------------------------------- utilidades
+def du(path):
+    try:
+        out = subprocess.run(["du", "-sb", path], capture_output=True, text=True, timeout=120).stdout
+        return int(out.split()[0]) if out.strip() else 0
+    except Exception:
+        return 0
+
+def human(n):
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024: return f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+def walk_files(root, limit=None):
+    for base, dirs, files in os.walk(root):
+        for f in files:
+            p = os.path.join(base, f)
+            try: yield p, os.path.getmtime(p), os.path.getsize(p)
+            except OSError: pass
+
+def sha1(path, chunk=1 << 20):
+    h = hashlib.sha1()
+    with open(path, "rb") as fh:
+        while True:
+            b = fh.read(chunk)
+            if not b: break
+            h.update(b)
+    return h.hexdigest()
+
+# ---------------------------------------------------------------- categorias
+def categorias():
+    cats = []
+    def add(nome, path, nota):
+        if os.path.exists(path):
+            cats.append((nome, path, du(path), nota))
+    add("WhatsApp Business - Media", f"{WA}/Media", "cache de midia recebida (nao apaga)")
+    add("WhatsApp Business - Databases", f"{WA}/Databases", "NAO APAGAR (chat)")
+    add("WhatsApp Business - Backups", f"{WA}/Backups", "NAO APAGAR")
+    add("Download", f"{SD}/Download", "revisao: apk, zip, installers")
+    add("DCIM (camera)", f"{SD}/DCIM", "NAO APAGAR")
+    add("Pictures", f"{SD}/Pictures", "NAO APAGAR")
+    add("Movies", f"{SD}/Movies", "NAO APAGAR")
+    add("Documents", f"{SD}/Documents", "NAO APAGAR")
+    add("Termux (home)", HOME, "projetos + caches")
+    add("Termux - temp de trabalho", "/data/data/com.termux/files/usr/tmp/opencode", "temporario do agente")
+    add("Termux - .cache", f"{HOME}/.cache", "cache (seguro)")
+    add("Termux - .npm", f"{HOME}/.npm", "cache npm (seguro)")
+    return cats
+
+def relatorio():
+    print("=" * 66)
+    print("  ARMAZENAMENTO DO CELULAR (via Termux)")
+    print("=" * 66)
+    total = 0
+    for nome, path, sz, nota in categorias():
+        total += sz
+        print(f"  {human(sz):>10}  {nome}")
+        print(f"              {path}")
+        if nota: print(f"              ({nota})")
+    print("-" * 66)
+    print(f"  {human(total):>10}  somatorio上述")
+    print(f"  {human(du(SD)):>10}  /storage/emulated/0")
+    try:
+        free = shutil.disk_usage(SD)
+        print(f"  {human(free.free):>10}  livres no volume compartilhado")
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------- safe
+def coletar_lixo():
+    """Itens inequivocamente lixo (nao ha perda util)."""
+    itens = []
+    agora = time.time()
+    # 1) thumbnails do Android (reconstroi sozinho)
+    for root in (f"{SD}/Android/media", f"{SD}/Pictures", f"{SD}/DCIM", HOME):
+        for base, dirs, files in os.walk(root):
+            if os.path.basename(base) in (".thumbnails", "thumbnails"):
+                sz = du(base)
+                if sz: itens.append(("thumbnails (reconstroi)", base, sz, None))
+    # 2) .Statuses do WhatsApp (status expira em 24h)
+    for base, dirs, files in os.walk(f"{WA}/Media"):
+        if os.path.basename(base) == ".Statuses":
+            sz = du(base)
+            if sz: itens.append(("status do WhatsApp (24h)", base, sz, None))
+    # 3) temporarios antigos no Download (.tmp/.part/.crdownload e afins)
+    dl = f"{SD}/Download"
+    if os.path.isdir(dl):
+        for p, mt, sz in walk_files(dl):
+            ext = os.path.splitext(p)[1].lower()
+            if ext in (".tmp", ".part", ".crdownload", ".download", ".partial") and agora - mt > 86400:
+                itens.append(("temp antigo no Download", p, sz, p))
+    # 4) temporario do agente (arquivos velhos em /usr/tmp/opencode)
+    tmp = "/data/data/com.termux/files/usr/tmp/opencode"
+    if os.path.isdir(tmp):
+        for p, mt, sz in walk_files(tmp):
+            if agora - mt > 7 * 86400:
+                itens.append(("temp do agente (>7d)", p, sz, p))
+    # 5) caches regeneráveis
+    for d in (f"{HOME}/.cache", f"{HOME}/.npm/_cacache", f"{HOME}/.cargo/registry/cache"):
+        if os.path.isdir(d):
+            itens.append(("cache regeneravel", d, du(d), None))  # None = diretorio
+    return itens
+
+def safe(dry=True):
+    itens = coletar_lixo()
+    if not itens:
+        print("nenhum lixo inequivoco encontrado."); return
+    total = sum(i[2] for i in itens)
+    print(f"lixo inequivoco: {human(total)} em {len(itens)} itens")
+    print("-" * 66)
+    for nome, path, sz, alvo in itens:
+        print(f"  {human(sz):>10}  {nome:28s} {path[:60]}")
+    if dry:
+        print("-" * 66)
+        print("dry-run: nada foi apagado. rode com --safe --yes para apagar.")
+        return
+    print("-" * 66)
+    for nome, path, sz, alvo in itens:
+        try:
+            if alvo is None:          # diretorio
+                shutil.rmtree(path, ignore_errors=True)
+            else:                     # arquivo
+                os.remove(alvo)
+            print(f"  removido: {path}")
+        except Exception as e:
+            print(f"  falhou: {path} ({e})")
+
+# ---------------------------------------------------------------- duplicados
+def duplicados(limite_mb=5, apagar=False):
+    grupos = defaultdict(list)
+    roots = [f"{SD}/Download", f"{SD}/DCIM", f"{SD}/Pictures", f"{SD}/Movies", f"{SD}/Documents"]
+    for root in roots:
+        if not os.path.isdir(root): continue
+        for p, mt, sz in walk_files(root):
+            if sz >= limite_mb * 1024 * 1024:
+                grupos[sz].append(p)
+    achados = []
+    for sz, paths in grupos.items():
+        if len(paths) < 2: continue
+        by_hash = defaultdict(list)
+        for p in paths:
+            try: by_hash[sha1(p)].append(p)
+            except Exception: pass
+        for h, ps in by_hash.items():
+            if len(ps) > 1:
+                total = sz * (len(ps) - 1)
+                achados.append((total, sz, ps))
+                print(f"  {human(total):>10} desperdicio | {human(sz):>8} x{len(ps)} | {os.path.basename(ps[0])[:40]}")
+                for p in ps: print(f"      {p}")
+                if apagar:
+                    for p in ps[1:]:
+                        try: os.remove(p); print(f"      removido: {p}")
+                        except Exception as e: print(f"      falhou: {p} ({e})")
+    if not achados: print("nenhum duplicado grande encontrado.")
+    else: print(f"\n  total recuperavel: {human(sum(a[0] for a in achados))}")
+
+# ---------------------------------------------------------------- helpers
+def maiores(min_mb=100):
+    lim = min_mb * 1024 * 1024
+    itens = []
+    for root in (f"{SD}/Download", f"{SD}/DCIM", f"{SD}/Pictures", f"{SD}/Movies", f"{SD}/Documents", f"{WA}/Media"):
+        if not os.path.isdir(root): continue
+        for p, mt, sz in walk_files(root):
+            if sz >= lim: itens.append((sz, mt, p))
+    itens.sort(reverse=True)
+    print(f"arquivos >= {min_mb} MB:")
+    for sz, mt, p in itens[:40]:
+        print(f"  {human(sz):>9}  {time.strftime('%Y-%m-%d', time.localtime(mt))}  {p}")
+    if not itens: print("  nenhum")
+
+def antigos(dias=365):
+    lim = time.time() - dias * 86400
+    itens = []
+    for root in (f"{SD}/Download",):
+        if not os.path.isdir(root): continue
+        for p, mt, sz in walk_files(root):
+            if mt < lim: itens.append((sz, mt, p))
+    itens.sort(reverse=True)
+    print(f"arquivos no Download com mais de {dias} dias:")
+    tot = 0
+    for sz, mt, p in itens[:60]:
+        tot += sz
+        print(f"  {human(sz):>9}  {time.strftime('%Y-%m-%d', time.localtime(mt))}  {p}")
+    print(f"  total: {human(tot)} em {len(itens)} arquivos")
+
+# ---------------------------------------------------------------- organizar
+CATEGORIAS = {
+    "documentos": (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".txt", ".md", ".odt", ".rtf"),
+    "compactados": (".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".tgz"),
+    "apks": (".apk", ".apks", ".xapk"),
+    "modelos-3d": (".stl", ".step", ".stp", ".obj", ".f3d", ".dxf", ".3mf", ".igs"),
+    "midia": (".mp3", ".mp4", ".m4a", ".aac", ".wav", ".ogg", ".jpg", ".jpeg", ".png", ".webp", ".heic"),
+    "programas": (".exe", ".msi", ".deb", ".rpm", ".run", ".sh", ".bat", ".apkm"),
+}
+
+def organizar():
+    """Move o Download para subpastas por tipo (reversivel, com manifesto)."""
+    dl = f"{SD}/Download"
+    if not os.path.isdir(dl):
+        print("sem pasta Download"); return
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    manifest = f"{HOME}/docs/organizacao-download-{stamp}.txt"
+    os.makedirs(os.path.dirname(manifest), exist_ok=True)
+    movidos = 0
+    with open(manifest, "w") as mf:
+        mf.write(f"# organizacao do Download em {stamp}\n# formato: TIPO | origem -> destino\n")
+        for p, mt, sz in sorted(walk_files(dl), key=lambda x: x[0]):
+            base = os.path.basename(p)
+            if os.path.dirname(p) == dl:      # so o nivel raiz
+                ext = os.path.splitext(base)[1].lower()
+                destino_pasta = None
+                for nome, exts in CATEGORIAS.items():
+                    if ext in exts:
+                        destino_pasta = f"{dl}/{nome}"; break
+                if not destino_pasta:
+                    destino_pasta = f"{dl}/outros"
+            else:
+                destino_pasta = os.path.dirname(p)   # ja esta em subpasta: deixa
+            if destino_pasta == os.path.dirname(p):
+                continue
+            try:
+                os.makedirs(destino_pasta, exist_ok=True)
+                destino = os.path.join(destino_pasta, base)
+                if os.path.exists(destino):
+                    destino = os.path.join(destino_pasta, f"{stamp}-{base}")
+                shutil.move(p, destino)
+                mf.write(f"{os.path.basename(destino_pasta)} | {p} -> {destino}\n")
+                movidos += 1
+            except Exception as e:
+                mf.write(f"ERRO | {p} | {e}\n")
+    print(f"{movidos} arquivos organizados por tipo")
+    print(f"manifesto (reversivel): {manifest}")
+    for nome in list(CATEGORIAS) + ["outros"]:
+        d = f"{dl}/{nome}"
+        if os.path.isdir(d):
+            sz = du(d)
+            n = sum(1 for _ in walk_files(d))
+            print(f"  {human(sz):>10}  {n:4d} arquivos  {nome}/")
+
+# ---------------------------------------------------------------- prune whatsapp
+def prune_whatsapp(dias=180, dry=True):
+    """Aplica a politica de 'auto-delete de midia' do WhatsApp (ex.: 180 dias)
+    APENAS nas pastas ORFA (prefixo 'WhatsApp ' sem 'Business'), porque o app
+    com.whatsapp NAO esta instalado — sao sobras do app antigo.
+    NAO toca em 'WhatsApp Business *' (app ativo) nem em Databases/.
+
+    A pesquisa confirma: apagar a midia NAO apaga as mensagens (fica o botao de
+    re-download) e notas de voz antigas sao 'generally safe' de apagar.
+    """
+    if not os.path.isdir(WA):
+        print("WhatsApp Business nao encontrado"); return
+    media = f"{WA}/Media"
+    orfas = [d for d in sorted(os.listdir(media))
+             if not d.startswith("WhatsApp Business") and os.path.isdir(os.path.join(media, d))]
+    lim = time.time() - dias * 86400
+    alvos, total, mantidos = [], 0, 0
+    for d in orfas:
+        for b, _, fs in os.walk(os.path.join(media, d)):
+            for f in fs:
+                p = os.path.join(b, f)
+                try:
+                    mt = os.path.getmtime(p); sz = os.path.getsize(p)
+                except OSError:
+                    continue
+                if mt < lim:
+                    alvos.append((p, sz)); total += sz
+                else:
+                    mantidos += sz
+    print(f"pastas orfas (app com.whatsapp removido): {len(orfas)}")
+    print(f" Remove: {human(total)} em {len(alvos)} arquivos com mais de {dias} dias")
+    print(f" Mantem: {human(mantidos)} (ultimos {dias} dias)")
+    if dry:
+        print(" dry-run: nada apagado. rode com --prune-whatsapp --yes para apagar.")
+        return
+    log = f"{HOME}/docs/whatsapp-prune-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    n = 0
+    with open(log, "w") as lf:
+        lf.write(f"# midia orfa do WhatsApp removida (>{dias}d) em {time.strftime('%Y-%m-%d %H:%M')}\n")
+        for p, sz in alvos:
+            try:
+                os.remove(p); n += 1
+                lf.write(f"{sz}\t{p}\n")
+            except Exception:
+                pass
+    # remove pastas vazias
+    for d in orfas:
+        for b, ds, fs in os.walk(os.path.join(media, d), topdown=False):
+            if not ds and not fs:
+                try: os.rmdir(b)
+                except Exception: pass
+    print(f" {n} arquivos removidos. log: {log}")
+
+# ---------------------------------------------------------------- full / quarentena
+SSD = "/storage/6E7C-8AB3"          # cartao SSD adotado (117 GB livres)
+QUAR = f"{SSD}/quarentena-termux"
+
+JUNK_EXT = (".tmp", ".temp", ".part", ".partial", ".crdownload", ".download", ".bak", ".old",
+             ".log", ".swp", ".swo", ".thumbdata", ".pending", ".nomedia.bak")
+
+def full(dias=365, min_mb=10, dry=True):
+    """Varre o armazenamento compartilhado INTEIRO e move o lixo para o SSD
+    (quarentena = reversivel). Nao apaga: move e deixa manifesto."""
+    sd = SD
+    if not os.path.isdir(sd):
+        print("sem acesso ao armazenamento compartilhado (rode termux-setup-storage)")
+        return
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    destino = f"{QUAR}/{stamp}"
+    lim = time.time() - dias * 86400
+
+    # 1) lixo por extensao
+    # 2) arquivos antigos (>=dias) e grandes (>=min_mb)
+    # 3) duplicatas exatas (por hash) -> fica a copia mais antiga
+    print(f"== varredura completa em {sd} (SSD de destino: {destino}) ==")
+    alvos = {}     # arquivo -> motivo
+    varridos = 0
+    for raiz, dirs, files in os.walk(sd):
+        # nao descer em areas do sistema/locked
+        dirs[:] = [d for d in dirs if d not in ("Android/data", "Android/obb", ".thumbnails")
+                   and not d.startswith(".")]
+        for f in files:
+            p = os.path.join(raiz, f)
+            try:
+                mt = os.path.getmtime(p); sz = os.path.getsize(p)
+            except OSError:
+                continue
+            varridos += 1
+            ext = os.path.splitext(f)[1].lower()
+            if ext in JUNK_EXT and sz < 200 * 1024 * 1024:
+                alvos[p] = "lixo (.%s)" % ext.strip(".")
+            elif mt < lim and sz >= min_mb * 1024 * 1024:
+                alvos[p] = f"antigo >{dias}d ({sz/2**20:.0f}MB)"
+    print(f" arquivos varridos: {varridos}")
+    print(f" candidatos (lixo/antigos): {len(alvos)}")
+    total = 0
+    for p, motivo in list(alvos.items())[:20]:
+        try: sz = os.path.getsize(p)
+        except OSError: sz = 0
+        total += sz
+        print(f"   {sz/2**20:8.1f} MB  {motivo:28s} {p[len(sd):][:70]}")
+    if len(alvos) > 20:
+        for p in list(alvos)[20:]:
+            try: total += os.path.getsize(p)
+            except OSError: pass
+        print(f"   ... e mais {len(alvos)-20} arquivos")
+    print(f" total candidato: {total/2**30:.2f} GB")
+    if dry:
+        print("\n dry-run: nada movido. rode com --full --yes para MOVER para a quarentena do SSD.")
+        return
+    os.makedirs(destino, exist_ok=True)
+    manifest = f"{HOME}/docs/quarentena-{stamp}.txt"
+    os.makedirs(os.path.dirname(manifest), exist_ok=True)
+    mov = 0; ok = 0
+    with open(manifest, "w") as mf:
+        mf.write(f"# quarentena {stamp}\n# motivo\tsize\torigem\tdestino\n")
+        for p, motivo in alvos.items():
+            rel = p[len(sd):].lstrip("/")
+            dst = os.path.join(destino, rel)
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.move(p, dst); mov += 1; ok += 1
+                mf.write(f"{motivo}\t{os.path.getsize(dst)}\t{p}\t{dst}\n")
+            except Exception as e:
+                mf.write(f"ERRO {motivo}\t0\t{p}\t{e}\n")
+    print(f" movidos para quarentena: {mov} (destino {destino})")
+    print(f" manifesto: {manifest}")
+    print(" (reversivel: os arquivos estao no SSD, em /quarentena-termux)")
+
+# ---------------------------------------------------------------- cli
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if not args or args[0] == "--report":
+        relatorio()
+    elif args[0] == "--safe":
+        safe(dry="--yes" not in args)
+    elif args[0] == "--organize":
+        organizar()
+    elif args[0] == "--full":
+        d = 365
+        if len(args) > 1 and args[1].isdigit(): d = int(args[1])
+        full(d, dry="--yes" not in args)
+    elif args[0] == "--prune-whatsapp":
+        d = 180
+        if len(args) > 1 and args[1].isdigit(): d = int(args[1])
+        prune_whatsapp(d, dry="--yes" not in args)
+    elif args[0] == "--duplicates":
+        duplicados(apagar="--yes" in args)
+    elif args[0] == "--big":
+        maiores(int(args[1]) if len(args) > 1 else 100)
+    elif args[0] == "--old":
+        antigos(int(args[1]) if len(args) > 1 else 365)
+    else:
+        print(__doc__)

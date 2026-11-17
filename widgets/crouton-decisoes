@@ -1,0 +1,6 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-decisoes - o que esta esperando decisao do dono (e o que ja foi decidido).
+set -uo pipefail
+export PATH="$HOME/bin:$PREFIX/bin:$PATH"
+clear
+"$HOME/bin/decidir" --lista

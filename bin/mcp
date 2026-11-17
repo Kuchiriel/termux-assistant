@@ -1,0 +1,380 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""mcp - meta-tool: achar e chamar QUALQUER tool dos MCPs da frota, sem pagar schema.
+
+POR QUE EXISTE (12/11): o Linux mediu que o catalogo completo do JARVIS custa
+~22 KB em TODO turno (~5-6k tokens) — e que catalogo grande PIORA a escolha da
+tool (arXiv 2605.24660). La a solucao foi `tools_search`/`tools_call`: so 17
+tools quentes no prompt, o resto atras de 2 meta-tools.
+
+Aqui o mesmo padrao, na forma mais barata possivel para o Termux: **uma CLI em
+vez de MCP**. O harness nao injeta schema nenhum (custo zero por request) e eu
+chego nas mesmas tools quando preciso.
+
+    mcp servers                     # servidores conhecidos (e quantas tools)
+    mcp tools [srv]                 # lista as tools (nome + descricao curta)
+    mcp search "rag"                # busca por nome/descricao em todos
+    mcp call coord_health           # chama (acha o servidor sozinho)
+    mcp call jarvis_rag_search '{"query": "meta tools", "collection": "memories"}'
+    mcp call coord coord_msg '{"to": "onca", "text": "oi"}'
+    mcp --full                      # nao truncar a resposta
+
+SERVIDORES: ~/.config/mcp-servers.json  (url + descricao; nada de segredo aqui)
+CACHE: ~/.cache/mcp-tools.json (1 h) — evita 2 handshakes por chamada.
+SAIDA: so o texto de `content`, truncado (padrao 2000 chars). JSON grande de MCP
+no contexto anula o ganho de existir um meta-tool.
+"""
+import argparse
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+
+HOME = os.path.expanduser("~")
+CONF = os.path.join(HOME, ".config/mcp-servers.json")
+CACHE = os.path.join(HOME, ".cache/mcp-tools.json")
+TTL = 3600
+TIMEOUT = 25
+LIMITE = 2000
+
+PADRAO = {
+    "coord": {"url": "http://${TA_LINUX_IP4:-100.121.100.103}:8765/mcp",
+              "desc": "coordenacao da frota (bus, roster, mensagens, phone-fs)"},
+    "knowledge": {"url": "http://${TA_LINUX_IP4:-100.121.100.103}:8766/mcp",
+                  "desc": "RAG + memoria + licoes + vault (Linux)"},
+}
+
+
+# ------------------------------------------------------------------ protocolo
+def rpc(url, payload, sid=None):
+    h = {"Content-Type": "application/json",
+         "Accept": "application/json, text/event-stream"}
+    if sid:
+        h["Mcp-Session-Id"] = sid
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                 headers=h, method="POST")
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        return (resp.headers.get("Mcp-Session-Id") or sid,
+                resp.read().decode("utf-8", "ignore"))
+
+
+def parse(corpo):
+    for linha in corpo.splitlines():
+        if linha.startswith("data:"):
+            try:
+                return json.loads(linha[5:].strip())
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        return json.loads(corpo)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def abrir(url):
+    sid, _ = rpc(url, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-06-18",
+                                  "capabilities": {},
+                                  "clientInfo": {"name": "mcp-termux", "version": "1"}}})
+    try:
+        rpc(url, {"jsonrpc": "2.0", "method": "notifications/initialized",
+                  "params": {}}, sid)
+    except Exception:  # noqa: BLE001
+        pass
+    return sid
+
+
+LAN_HOST = "${TA_LINUX_USER:-nixos}@${TA_LINUX_LAN:-192.168.15.10}"
+TAILNET = "${TA_LINUX_IP4:-100.121.100.103}"
+TAILNET6 = "${TA_LINUX_HOST6:-fd7a:115c:a1e0::7f01:64bd}"
+TUNEL = {8765: 18765, 8766: 18766}
+
+
+def _aberto(host, porta, t=0.8):
+    # create_connection escolhe a familia IPv4/IPv6 automaticamente.
+    try:
+        with socket.create_connection((host, porta), timeout=t):
+            return True
+    except OSError:
+        return False
+
+
+def _tunel(porta):
+    """Garante o tunel SSH pela LAN. Medido 14/11: a tailnet celular->PC cai,
+    a LAN (${TA_LINUX_LAN:-192.168.15.10}) continua. O MCP do Linux faz bind NO IP da tailnet,
+    entao o tunel precisa apontar para esse IP, nao para a LAN."""
+    local = TUNEL[porta]
+    if _aberto("127.0.0.1", local):
+        return local
+    try:
+        subprocess.run(["ssh", "-f", "-N", "-o", "BatchMode=yes",
+                        "-o", "ConnectTimeout=8", "-o", "ExitOnForwardFailure=yes",
+                        "-o", "ServerAliveInterval=30",
+                        "-L", "%d:%s:%d" % (local, TAILNET, porta), LAN_HOST],
+                       capture_output=True, timeout=25)
+    except Exception:  # noqa: BLE001
+        return None
+    return local if _aberto("127.0.0.1", local) else None
+
+
+def resolver_urls(d):
+    """Resolve cada servidor MCP pela SUA porta.
+
+    O fallback antigo decidia globalmente pela porta 8765: se coord abrisse
+    direto, knowledge (8766) ficava sem tunnel mesmo estando fechado. Agora
+    cada porta e testada individualmente. MCP_LAN=0 desliga o fallback;
+    MCP_LAN=1 forca o tunel de todas.
+    """
+    modo = os.environ.get("MCP_LAN", "auto")
+    saida = {}
+    for nome, v in d.items():
+        u = v.get("url", "")
+        m = re.match(r"http://" + re.escape(TAILNET) + r":(\d+)(/.*)$", u)
+        if not m:
+            saida[nome] = v
+            continue
+        porta, resto = int(m.group(1)), m.group(2)
+        if modo != "1":
+            if _aberto(TAILNET, porta):
+                saida[nome] = v
+                continue
+            # MEDIDO 16/11: IPv4 da tailnet morto, IPv6 do mesmo host ativo.
+            if _aberto(TAILNET6, porta, t=2.0):
+                saida[nome] = dict(v, url="http://[%s]:%d%s" % (TAILNET6, porta, resto))
+                continue
+        if modo == "0":
+            saida[nome] = v
+            continue
+        local = _tunel(porta)
+        saida[nome] = dict(v, url=("http://127.0.0.1:%d%s" % (local, resto))
+                           if local else u)
+    return saida
+
+
+def servidores():
+    if os.path.isfile(CONF):
+        try:
+            with open(CONF, encoding="utf-8") as fh:
+                d = json.load(fh)
+            if isinstance(d, dict):
+                # aceita "_nota" e comentarios: so entra quem tem url
+                limpo = {k: v for k, v in d.items()
+                         if not k.startswith("_") and isinstance(v, dict) and v.get("url")}
+                if limpo:
+                    return resolver_urls(limpo)
+        except Exception:  # noqa: BLE001
+            pass
+    return resolver_urls(PADRAO)
+
+
+def carregar_cache():
+    try:
+        with open(CACHE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def salvar_cache(d):
+    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+    try:
+        with open(CACHE, "w", encoding="utf-8") as fh:
+            json.dump(d, fh)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def tools_de(nome, url, forcar=False):
+    cache = carregar_cache()
+    c = cache.get(nome)
+    if c and not forcar and time.time() - c.get("ts", 0) < TTL:
+        return c.get("tools", [])
+    sid = abrir(url)
+    _, corpo = rpc(url, {"jsonrpc": "2.0", "id": 2, "method": "tools/list",
+                         "params": {}}, sid)
+    ts = parse(corpo).get("result", {}).get("tools", [])
+    if ts:
+        cache[nome] = {"ts": int(time.time()), "tools": ts}
+        salvar_cache(cache)
+    return ts
+
+
+# ---------------------------------------------------------------------- acoes
+def acao_servers(args):
+    conf = servidores()
+    linhas = []
+    for nome, cfg in conf.items():
+        try:
+            ts = tools_de(nome, cfg["url"], args.atualizar)
+            estado = "%d tools" % len(ts)
+        except Exception as e:  # noqa: BLE001
+            estado = "FORA (%s)" % str(e)[:40]
+        linhas.append((nome, cfg.get("url", ""), cfg.get("desc", ""), estado))
+    if args.json:
+        print(json.dumps([{"nome": n, "url": u, "desc": d, "estado": e}
+                          for n, u, d, e in linhas], ensure_ascii=False, indent=1))
+        return 0
+    for n, u, d, e in linhas:
+        print("%-10s %-34s %s" % (n, e, d))
+    return 0
+
+
+def acao_tools(args):
+    conf = servidores()
+    alvos = [args.servidor] if args.servidor else list(conf)
+    for nome in alvos:
+        if nome not in conf:
+            print("servidor desconhecido: %s (veja `mcp servers`)" % nome,
+                  file=sys.stderr)
+            continue
+        try:
+            ts = tools_de(nome, conf[nome]["url"], args.atualizar)
+        except Exception as e:  # noqa: BLE001
+            print("%s: FORA (%s)" % (nome, str(e)[:60]), file=sys.stderr)
+            continue
+        print("== %s (%d) ==" % (nome, len(ts)))
+        for t in ts:
+            d = (t.get("description") or "").split("\n")[0][:96]
+            print("  %-28s %s" % (t.get("name"), d))
+    return 0
+
+
+def acao_search(args):
+    conf = servidores()
+    alvo = (args.termo or "").strip().lower()
+    achados = []
+    for nome, cfg in conf.items():
+        try:
+            ts = tools_de(nome, cfg["url"], args.atualizar)
+        except Exception:  # noqa: BLE001
+            continue
+        for t in ts:
+            texto = ("%s %s" % (t.get("name", ""), t.get("description", ""))).lower()
+            if not alvo or alvo in texto or alvo == "all":
+                achados.append((nome, t.get("name"),
+                                (t.get("description") or "").split("\n")[0][:100]))
+    if args.json:
+        print(json.dumps([{"servidor": n, "tool": t, "desc": d}
+                          for n, t, d in achados], ensure_ascii=False, indent=1))
+        return 0 if achados else 1
+    if not achados:
+        print("nada com \"%s\" — tente `mcp search all`" % args.termo)
+        return 1
+    for n, t, d in achados[:args.n]:
+        print("%-10s %-28s %s" % (n, t, d))
+    if len(achados) > args.n:
+        print("  (+%d — use --n)" % (len(achados) - args.n))
+    return 0
+
+
+def acao_call(args):
+    conf = servidores()
+    alvos = list(args.alvos or [])
+    nome_srv, tool, bruto = None, None, "{}"
+    if len(alvos) == 1:
+        tool = alvos[0]
+    elif len(alvos) == 2:
+        if alvos[1].lstrip().startswith("{"):
+            tool, bruto = alvos[0], alvos[1]
+        else:
+            nome_srv, tool = alvos[0], alvos[1]
+    elif len(alvos) == 3:
+        nome_srv, tool, bruto = alvos
+    else:
+        print("uso: mcp call <tool> ['<json>']  |  mcp call <srv> <tool> ['<json>']",
+              file=sys.stderr)
+        return 2
+
+    try:
+        argumentos = json.loads(bruto)
+    except json.JSONDecodeError as e:
+        print("json invalido: %s" % e, file=sys.stderr)
+        return 2
+
+    candidatos = [nome_srv] if nome_srv else list(conf)
+    for nome in candidatos:
+        if nome not in conf:
+            continue
+        try:
+            ts = tools_de(nome, conf[nome]["url"])
+        except Exception:  # noqa: BLE001
+            continue
+        if any(t.get("name") == tool for t in ts):
+            try:
+                sid = abrir(conf[nome]["url"])
+                _, corpo = rpc(conf[nome]["url"],
+                               {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                                "params": {"name": tool, "arguments": argumentos}},
+                               sid)
+            except Exception as e:  # noqa: BLE001
+                print("%s: falhou (%s)" % (tool, str(e)[:90]), file=sys.stderr)
+                return 3
+            d = parse(corpo)
+            if "error" in d:
+                print("erro: %s" % str(d["error"])[:200], file=sys.stderr)
+                return 1
+            res = d.get("result", {})
+            texto = "\n".join(i.get("text", "") for i in res.get("content", []))
+            if res.get("isError"):
+                print("tool devolveu erro: %s" % texto[:200], file=sys.stderr)
+                return 1
+            texto = texto.strip()
+            limite = len(texto) if args.full else args.limite
+            print(texto[:limite])
+            if not args.full and len(texto) > limite:
+                print("... [%d chars; --full para tudo]" % len(texto))
+            return 0
+    print("tool \"%s\" nao existe em nenhum servidor (use `mcp search`)" % tool,
+          file=sys.stderr)
+    return 2
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(
+        prog="mcp", description="meta-tool: achar e chamar tools dos MCPs da frota",
+        epilog="ex.: mcp search rag  |  mcp call coord_health")
+    ap.add_argument("--json", action="store_true", dest="json")
+    ap.add_argument("--atualizar", action="store_true", help="ignora o cache de 1 h")
+    ap.add_argument("--full", action="store_true", help="nao truncar a resposta")
+    ap.add_argument("--limite", type=int, default=LIMITE)
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("servers", help="servidores conhecidos")
+    p.add_argument("--json", action="store_true", dest="json")
+    p.add_argument("--atualizar", action="store_true", default=argparse.SUPPRESS)
+    p.set_defaults(fn=acao_servers)
+
+    p = sub.add_parser("tools", help="lista tools de um servidor")
+    p.add_argument("servidor", nargs="?")
+    p.add_argument("--json", action="store_true", dest="json")
+    p.add_argument("--atualizar", action="store_true", default=argparse.SUPPRESS)
+    p.set_defaults(fn=acao_tools)
+
+    p = sub.add_parser("search", help="busca por nome/descricao")
+    p.add_argument("termo", nargs="?", default="all")
+    p.add_argument("-n", type=int, default=20)
+    p.add_argument("--json", action="store_true", dest="json")
+    p.add_argument("--atualizar", action="store_true", default=argparse.SUPPRESS)
+    p.set_defaults(fn=acao_search)
+
+    p = sub.add_parser("call", help="chama uma tool")
+    p.add_argument("alvos", nargs="*", metavar="tool|srv|json")
+    p.add_argument("--full", action="store_true")
+    p.add_argument("--limite", type=int, default=LIMITE)
+    p.set_defaults(fn=acao_call, json=False)
+
+    a = ap.parse_args(argv)
+    if not getattr(a, "fn", None):
+        ap.print_help()
+        return 2
+    try:
+        return a.fn(a)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

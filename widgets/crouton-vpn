@@ -1,0 +1,28 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-vpn - status da cadeia VPN nitrov15 (celular -> Tor -> onion -> container -> SNX)
+# Mostra o que cada camada esta fazendo e se o IP do dono esta protegido.
+
+set -uo pipefail
+export PATH="$PATH:$HOME/bin"
+
+say() { printf '%s\n' "$*"; }
+tor_on() { (exec 3<>/dev/tcp/127.0.0.1/9050) 2>/dev/null; }
+
+say "== cadeia VPN nitrov15 =="
+if tor_on; then
+  say "1. Tor local ......... LIGADO"
+  say "   exit: $(proxychains4 -f "$HOME/.proxychains.conf" curl -s -m 20 https://check.torproject.org/api/ip 2>/dev/null | head -c 70)"
+else
+  say "1. Tor local ......... PARADO  (sem Tor o celular nao deve tocar no gateway)"
+fi
+
+if timeout 6 bash -c 'cat < /dev/null > /dev/tcp/${TA_LINUX_IP4:-100.121.100.103}/8765' 2>/dev/null; then
+  say "2. tailnet (NixOS) ... ALCANCAVEL (coord-mcp :8765)"
+else
+  say "2. tailnet (NixOS) ... SEM ROTA (Tailscale desligado?)"
+fi
+
+say "3. container vpnsec-snx: reachavel via .onion (Tor)"
+say ""
+say "regra dura: o celular NUNCA conecta direto no gateway."
+say "use 'crouton-leak' para checar o egress antes de qualquer teste."

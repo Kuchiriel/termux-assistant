@@ -1,0 +1,164 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# oc-doctor - diagnostico do ambiente Termux + OpenCode.
+# Mostra versoes, servicos, config, MCPs, skills, espaco e pendencias.
+# Nao muda nada. Use: oc-doctor [--json]
+
+set -uo pipefail
+JSON=0
+[[ "${1:-}" == "--json" ]] && JSON=1
+
+hr() { printf '%s\n' "------------------------------------------------------------"; }
+sec() { printf '\n\033[1;36m%s\033[0m\n' "$*"; }
+ok() { printf '  \033[32mok\033[0m      %s\n' "$*"; }
+warn() { printf '  \033[33matencao\033[0m %s\n' "$*"; }
+bad() { printf '  \033[31mFALHA\033[0m   %s\n' "$*"; }
+
+# ---------- versoes ----------
+sec "1. Termux / Android"
+printf '  termux:  %s (pkg %s)\n' "$(dpkg-query -W -f='${Version}' termux-tools 2>/dev/null | cut -d- -f1)" "$(dpkg-query -W -f='${Version}' termux-tools 2>/dev/null | cut -d- -f1)"
+printf '  prefix:  %s\n' "$PREFIX"
+printf '  kernel:  %s\n' "$(uname -srm)"
+printf '  storage: %s (usado %s)\n' "$(df -h "$HOME" | awk 'NR==2{print $4" livres de "$2}')" "$(df -h "$HOME" | awk 'NR==2{print $5}')"
+[[ -d "$HOME/storage" ]] && ok "armazenamento compartilhado liberado" || warn "sem ~/storage (rode termux-setup-storage)"
+
+# ---------- OpenCode ----------
+sec "2. OpenCode"
+for b in opencode opencode2; do
+  if command -v "$b" >/dev/null 2>&1; then
+    printf '  %-10s %s\n' "$b" "$($b --version 2>/dev/null | head -1)"
+  else
+    printf '  %-10s ausente\n' "$b"
+  fi
+done
+if command -v opencode >/dev/null 2>&1; then
+  # MEDIDO 12/11: 'opencode service status' e' INSTAVEL: com o servico VIVO, a
+  # mesma chamada devolveu 'stopped' em 3 de 6 rodadas (enquanto a porta
+  # respondia HTTP 200 nas 6) — o CLI perde a corrida com o registro do
+  # servico logo apos um start. O proprio oc-doctor chegou a reportar
+  # 'servico (2.2.5): stopped' com o servidor no ar. Alem disso, cada chamada
+  # paga 4,36 s de startup do CLI (medido) para ler um booleano.
+  # Agora: a PORTA e' a fonte da verdade (9 ms), e o CLI so completa o texto.
+  _oc_url=""
+  for _p in 52031 4599; do
+    if timeout 6 curl -s -o /dev/null "http://127.0.0.1:${_p}/" 2>/dev/null; then
+      _oc_url="http://127.0.0.1:${_p}"; break
+    fi
+  done
+  if [ -n "$_oc_url" ]; then
+    printf '  servico (2.2.5): %s (porta viva)\n' "$_oc_url"
+  else
+    printf '  servico (2.2.5): PARADO (nenhuma porta 52031/4599 responde)\n'
+  fi
+fi
+if command -v opencode2 >/dev/null 2>&1; then
+  printf '  servico (2.0.0-termux): %s\n' "$(opencode2 service status 2>/dev/null | tail -1)"
+fi
+
+# ---------- config ----------
+sec "3. Config e MCPs"
+CFG="$HOME/.config/opencode/opencode.json"
+if [[ -f "$CFG" ]]; then
+  ok "config: $CFG"
+  python3 - "$CFG" <<'PY' 2>/dev/null || true
+import json,sys,os
+d=json.load(open(sys.argv[1]))
+print("  model      :", d.get("model") or "(nao fixado)")
+print("  compaction :", json.dumps(d.get("compaction") or {}))
+print("  plugins    :", d.get("plugins") or "[]")
+srv=((d.get("mcp") or {}).get("servers") or {})
+print("  mcp        :", ", ".join(f"{k}{'(off)' if v.get('disabled') else ''}" for k,v in srv.items()) or "nenhum")
+PY
+else
+  bad "sem $CFG"
+fi
+for f in "$HOME/.config/opencode/opencode.json.bak."*; do
+  [[ -f "$f" ]] && printf '  backup: %s (%s)\n' "$(basename "$f")" "$(du -h "$f" | cut -f1)"
+done
+
+sec "4. Skills e plugins"
+for d in "$HOME"/.config/opencode/skills/*/; do
+  [[ -d "$d" ]] && printf '  skill: %s\n' "$(basename "$d")"
+done
+ls "$HOME/.config/opencode/plugins"/*.js >/dev/null 2>&1 && ls "$HOME/.config/opencode/plugins"/*.js || printf '  plugins: nenhum carregado (ok em v2; DCP/mem sao v1)\n'
+
+# ---------- rede ----------
+sec "5. Rede (anonimato)"
+if (exec 3<>/dev/tcp/127.0.0.1/9050) 2>/dev/null; then
+  ok "Tor local de pe (SOCKS 9050)"
+  printf '  saida via Tor: %s\n' "$(proxychains4 -f "$HOME/.proxychains.conf" curl -s -m 20 https://check.torproject.org/api/ip 2>/dev/null | head -c 120)"
+else
+  warn "Tor local PARADO (tor -f ~/.torrc &)"
+fi
+ip=$(curl -s -m 10 https://api.ipify.org 2>/dev/null)
+printf '  IP publico direto: %s\n' "${ip:-desconhecido}"
+_tn_ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/");print a[1]}' | grep -E '^100\.' | head -1)
+COORD_MCP_IPV6="${COORD_MCP_IPV6:-${TA_LINUX_HOST6:-fd7a:115c:a1e0::7f01:64bd}}"
+for h in ${TA_LINUX_IP4:-100.121.100.103}; do
+  if timeout 4 bash -c "cat < /dev/null > /dev/tcp/$h/8765" 2>/dev/null; then
+    ok "coord-mcp $h:8765 alcancavel"
+  elif timeout 5 python3 -c "import socket; socket.create_connection(('$COORD_MCP_IPV6',8765),timeout=3).close()" 2>/dev/null; then
+    ok "coord-mcp via IPv6: UP ($COORD_MCP_IPV6:8765; IPv4 direto fora)"
+  elif timeout 90 "$HOME/bin/coord-cli" health 2>/dev/null | python3 -c "
+import sys,json
+try: raise SystemExit(0 if json.load(sys.stdin).get('rag_ok') is True else 1)
+except Exception: raise SystemExit(1)
+" 2>/dev/null; then
+    ok "coord-mcp via cliente real: UP (IPv4/IPv6 oscilando; coord-cli health OK)"
+  elif [ -n "$_tn_ip" ]; then
+    _lan_ip="${HOST_LAN_IP:-${TA_LINUX_LAN:-192.168.15.10}}"
+    if timeout 2 bash -c "cat < /dev/null > /dev/tcp/$_lan_ip/22" 2>/dev/null; then
+      _health=$(timeout 20 "$HOME/bin/coord-cli" health 2>/dev/null)
+      if printf '%s' "$_health" | python3 -c "
+import sys,json
+try: raise SystemExit(0 if json.load(sys.stdin).get('rag_ok') is True else 1)
+except Exception: raise SystemExit(1)
+" 2>/dev/null; then
+        ok "coord-mcp via LAN: UP (direto tailnet fora; fallback ativo)"
+      else
+        warn "coord-mcp direto fora; host VIVO via LAN $_lan_ip, mas o fallback nao respondeu"
+      fi
+    else
+      warn "coord-mcp $h:8765 inacessivel (celular TEM tailnet $_tn_ip; causa no host/rota, nao no Tailscale local)"
+    fi
+  else
+    warn "coord-mcp $h:8765 inacessivel (Tailscale local ausente?)"
+  fi
+done
+
+# ---------- pendencias ----------
+
+# ---------- plugin, auto-wake, fila, RAM ----------
+sec "6. Plugin, auto-wake e fila"
+for m in module setup hook-context auto-wake-hook mcp-trim catalog; do
+  f="$HOME/.local/state/memory-termux-$m.txt"
+  if [[ -f "$f" ]]; then ok "plugin marcador: $m ($(stat -c %y "$f" 2>/dev/null | cut -d. -f1 | cut -c1-19))"
+  else warn "plugin marcador ausente: $m"; fi
+done
+if [[ -f "$HOME/.local/state/memory-termux-auto-wake-hook.txt" ]]; then
+  ok "auto-wake: hook experimental.idle registrado (agente se acorda sozinho, visivel no TUI)"
+else warn "auto-wake: hook NAO registrado"; fi
+aw=$(timeout 20 "$HOME/bin/auto-wake" status 2>/dev/null | head -1)
+printf '  auto-wake: %s\n' "${aw:-?}"
+pl=$(timeout 30 "$HOME/bin/phone-fs" plans 2>/dev/null | grep -c proposto)
+[[ "${pl:-0}" -gt 0 ]] && warn "phone-fs: $pl proposta(s) aguardando revisao do dono" || ok "phone-fs: nenhuma proposta pendente"
+ram=$(free -m | awk 'NR==2{print $7}')
+[[ "${ram:-0}" -lt 800 ]] && warn "RAM: ${ram} MB disponiveis (celular trava com swap cheia)" || ok "RAM: ${ram} MB disponiveis"
+sw=$(free -m | awk 'NR==3{print $3}')
+printf '  swap usada: %s MB\n' "${sw:-0}"
+
+sec "7. Saude do host (via tailnet)"
+hw=$(timeout 120 "$HOME/bin/host-watch" widget 2>/dev/null | head -1)
+case "$hw" in
+  OK*) ok "host: $hw" ;;
+  ATENCAO*) warn "host: $hw" ;;
+  CRITICO*) warn "host: $hw" ;;
+  INDISPONIVEL*) warn "host: $hw (sem dado: sem alerta falso)" ;;
+  *) printf '  host: %s\n' "${hw:-sem leitura}" ;;
+esac
+
+sec "8. Pendencias conhecidas"
+[[ -f "$HOME/.config/opencode/dcp.jsonc" ]] && warn "config orfa: ~/.config/opencode/dcp.jsonc (plugin DCP desativado)"
+[[ -d "$HOME/vpn-port/snx-rs/target" ]] && warn "target/ do Rust presente (rebuild: cargo build --release)" 
+printf '  disco livre: %s\n' "$(df -h "$HOME" | awk 'NR==2{print $4}')"
+
+sec "Fim"

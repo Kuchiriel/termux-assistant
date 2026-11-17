@@ -1,0 +1,116 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# assistant-fast — assistente do celular com entrada por TEXTO ou voz, sessão
+# persistente e log em texto (JSONL).
+#
+# Por que existe (medido 17/11): o /bin/assistant abria uma sessão nova do
+# opencode por pergunta -> 27,8 s para responder "OK". Com --session fixo caiu
+# para 5,7-6,5 s (4-5x). O modelo free (deepseek) devolveu 429 com retry de
+# 11,7 h; o caminho estável e nvidia/minimax com a key rotacionável.
+#
+# Uso:
+#   assistant-fast --text "pergunta"       # responde e sai (sem dialog)
+#   assistant-fast --ask                   # abre campo de TEXTO (widget)
+#   assistant-fast --voice                 # abre campo de VOZ (widget)
+#   assistant-fast --ask --speak           # texto + fala a resposta
+#   assistant-fast --log 10                # mostra as ultimas 10 interacoes
+set -uo pipefail
+export PATH="$PATH:$HOME/bin"
+
+LOG="${ASSISTANT_LOG:-$HOME/.local/state/assistant/log.jsonl}"
+SID_FILE="${ASSISTANT_SID_FILE:-$HOME/.local/state/assistant/session.id}"
+MODEL="${ASSISTANT_MODEL:-nvidia/minimaxai/minimax-m3.1-flash}"
+RUNDIR="${TMPDIR:-$PREFIX/tmp/opencode}/assistant-run"
+mkdir -p "$(dirname "$LOG")" "$(dirname "$SID_FILE")" "$RUNDIR"
+
+MODE="text"
+QUESTION=""
+SPEAK=0
+NLINES=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --text)   MODE="text"; QUESTION="${2:-}"; shift 2 ;;
+    --ask)    MODE="dialog-text"; shift ;;
+    --voice)  MODE="dialog-voice"; shift ;;
+    --speak)  SPEAK=1; shift ;;
+    --log)    MODE="log"; NLINES="${2:-10}"; shift 2 ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    *) QUESTION="${QUESTION:+$QUESTION }$1"; shift ;;
+  esac
+done
+
+ms() { date +%s%3N; }
+json_escape() { python3 -c 'import json,sys;print(json.dumps(sys.argv[1],ensure_ascii=False))' "$1"; }
+
+log_event() {
+  python3 - "$LOG" "$1" <<'PY'
+import json,sys
+p, linha = sys.argv[1], sys.argv[2]
+try:
+    open(p, "a", encoding="utf-8").write(linha + "\n")
+except Exception:
+    pass
+PY
+}
+
+if [ "$MODE" = "log" ]; then
+  if [ -f "$LOG" ]; then
+    tail -n "$NLINES" "$LOG" | python3 -c '
+import json,sys
+for l in sys.stdin:
+ try:
+  d=json.loads(l)
+  ts=str(d.get("ts",""))[:19]
+  route=str(d.get("route") or d.get("mode") or "")
+  ms=str(d.get("ms_total","?"))
+  q=str(d.get("q",""))[:48]
+  a=str(d.get("a","")).replace("\n"," ")[:60]
+  print(ts+"  "+route+"  "+ms+"ms  Q: "+q+"  R: "+a)
+ except Exception: print(l.strip()[:120])'
+  else echo "(sem log ainda)"; fi
+  exit 0
+fi
+
+T0=$(ms)
+if [ "$MODE" = "dialog-text" ]; then
+  raw=$(termux-dialog text -i "Pergunta (texto)" -t "Assistente" 2>/dev/null)
+  QUESTION=$(printf '%s' "$raw" | jq -r '.text // empty' 2>/dev/null)
+elif [ "$MODE" = "dialog-voice" ]; then
+  raw=$(termux-dialog speech -i "Fale a pergunta" -t "Assistente" 2>/dev/null)
+  QUESTION=$(printf '%s' "$raw" | jq -r '.text // empty' 2>/dev/null)
+fi
+[ -z "$QUESTION" ] && { echo "(sem entrada)"; exit 0; }
+T1=$(ms)
+
+SID=$(cat "$SID_FILE" 2>/dev/null)
+[ -z "$SID" ] && SID="ses_assistant_mobile_$(date +%Y%m%d)"
+printf '%s' "$SID" > "$SID_FILE"
+
+# --session reaproveita o servo e o contexto: e' o que corta 27.8s -> ~6s.
+T2=$(ms)
+ANSWER=$(cd "$RUNDIR" 2>/dev/null && timeout 120 opencode run --session "$SID" \
+  --model "$MODEL" --format json "$QUESTION" 2>/dev/null \
+  | jq -r 'select(.type=="text") | .part.text // empty' 2>/dev/null | head -c 1200)
+T3=$(ms)
+[ -z "$ANSWER" ] && ANSWER="(sem resposta — verifique a key/modelo)"
+
+T4=$T3
+if [ "$SPEAK" = "1" ] && command -v termux-tts-speak >/dev/null 2>&1; then
+  FALA=$(printf '%s' "$ANSWER" | sed 's/[.,!?;:]/ /g' | head -c 400)
+  termux-tts-speak -l pt-br "$FALA" >/dev/null 2>&1 || true
+  T4=$(ms)
+fi
+
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+LINE=$(python3 -c '
+import json,sys
+ts,mode,q,a,t0,t1,t2,t3,t4,model = sys.argv[1:11]
+print(json.dumps({"ts":ts,"mode":mode,"q":q[:300],"a":a[:600],"model":model,
+ "ms_input":int(t1)-int(t0),"ms_llm":int(t3)-int(t2),"ms_tts":int(t4)-int(t3),
+ "ms_total":int(t4)-int(t0)},ensure_ascii=False))' \
+  "$TS" "$MODE" "$QUESTION" "$ANSWER" "$T0" "$T1" "$T2" "$T3" "$T4" "$MODEL")
+log_event "$LINE"
+
+printf '%s\n' "$ANSWER"
+command -v termux-toast >/dev/null 2>&1 && \
+  termux-toast "$(printf '%s' "$ANSWER" | head -c 160)" >/dev/null 2>&1 || true

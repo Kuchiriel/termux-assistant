@@ -1,0 +1,7 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-doc - fotografa um documento, le o texto (OCR local) e indexa.
+# Depois: `doc-foto --busca termo` acha o texto de qualquer documento ja lido.
+set -uo pipefail
+export PATH="$HOME/bin:$PREFIX/bin:$PATH"
+clear
+"$HOME/bin/doc-foto"

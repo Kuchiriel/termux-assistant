@@ -1,0 +1,55 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# session-clients — saude das sessoes da frota no host: roster x cliente anexado.
+#
+# POR QUE (medido 08/11): o watcher do host (scripts/agents-watcher.sh) so le o bus
+# se tiver um CLIENTE anexado na sessao que ele assiste (o codinome vem do
+# roster.json pela sessao). Sem cliente -> sem watcher -> o wake no bus nunca e
+# consumido (a mensagem fica la, esperando). O 'agent-keepalive.sh' e o que reabre
+# o cliente — e nem sempre esta rodando.
+#
+# Este check e SO LEITURA: nada e reiniciado, nada e mexido.
+#
+#   session-clients            # mede via SSH (do celular para o host)
+set -uo pipefail
+HOST_TAILNET="${TA_LINUX_USER:-nixos}@${TA_LINUX_IP4:-100.121.100.103}"
+HOST_LAN="${TA_LINUX_USER:-nixos}@${TA_LINUX_LAN:-192.168.15.10}"
+
+probe_host() {
+  local host="$1"
+  python3 - <<'PY' | timeout 25 ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" 'python3 -' 2>&1
+import sys
+sys.stdout.write(r'''
+import json, os, subprocess
+r = os.path.expanduser("~/projects/.agents/roster.json")
+try:
+    d = json.load(open(r))
+except Exception as e:
+    print("  roster ausente/ilegivel:", e)
+    raise SystemExit
+ps = subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True).stdout
+sem = []
+for a in d.get("agents") or []:
+    cod = a.get("codename") or "?"
+    sid = a.get("session") or ""
+    tem = bool(sid) and ("-s " + sid) in ps
+    print("   %-22s sessao=%-30s cliente_anexado=%s" % (cod[:22], sid[:30], "SIM" if tem else "NAO"))
+    if not tem:
+        sem.append(cod)
+ka = len([l for l in ps.split("\n") if "agent-keepalive" in l and "grep" not in l])
+print("   keepalive rodando: %s" % ("SIM" if ka else "NAO"))
+print("   SEM CLIENTE (wake no bus fica nao consumido): %s" % (", ".join(sem) if sem else "nenhum"))
+''')
+PY
+}
+
+route="tailnet"
+out=$(probe_host "$HOST_TAILNET")
+if ! grep -q 'SEM CLIENTE' <<< "$out"; then
+  lan_out=$(probe_host "$HOST_LAN")
+  if grep -q 'SEM CLIENTE' <<< "$lan_out"; then
+    out="$lan_out"
+    route="LAN"
+  fi
+fi
+printf '%s\n' "$out" | tail -12
+printf '   rota usada: %s\n' "$route"

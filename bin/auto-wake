@@ -1,0 +1,103 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# auto-wake — fila de auto-tarefas do Crouton Alpha (celular).
+#
+# COMO FUNCIONA (visivel NO TUI, nada de background):
+#   1. o agente enfileira a proxima tarefa:  auto-wake enqueue "tarefa"
+#   2. quando a sessao termina o turno e fica ociosa, o plugin (hook experimental.idle)
+#      pega a proxima tarefa e ADMITE um prompt sintetico NA MESMA SESSAO
+#      -> o trabalho continua aparecendo na conversa do OpenCode, na sua frente.
+#   3. quando a fila fica vazia, a sessao fica ociosa de verdade (nada de loop infinito).
+#
+# Comandos:
+#   auto-wake enqueue "tarefa"     # enfileira (fila FIFO)
+#   auto-wake next                 # imprime e remove a proxima (usado pelo plugin)
+#   auto-wake status               # fila + orcamento de wakes
+#   auto-wake budget               # interno: 0 = pode acordar, 1 = sem orcamento
+#   auto-wake limit N              # ajusta o maximo de wakes por hora (default 12)
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+
+STATE="$HOME/.local/state"
+QUEUE="$STATE/auto-queue.txt"
+BUDGET="$STATE/auto-wake-budget.json"
+mkdir -p "$STATE"
+[ -f "$QUEUE" ] || : > "$QUEUE"
+
+MAX_PER_HOUR="${AUTO_WAKE_MAX_PER_HOUR:-12}"
+MIN_GAP_MIN="${AUTO_WAKE_MIN_GAP_MIN:-3}"
+
+now=$(date +%s)
+
+cmd_enqueue() {
+  local t="$*"
+  [ -z "$t" ] && { echo "auto-wake: tarefa vazia" >&2; exit 2; }
+  # remove entradas antigas (fila pode ter duplicatas)
+  grep -Fxq "$t" "$QUEUE" 2>/dev/null || echo "$t" >> "$QUEUE"
+  echo "auto-wake: enfileirado ($(wc -l < "$QUEUE") na fila) :: $t"
+}
+
+cmd_next() {
+  [ -s "$QUEUE" ] || exit 1
+  local t
+  t=$(head -1 "$QUEUE")
+  tail -n +2 "$QUEUE" > "$QUEUE.tmp" 2>/dev/null && mv "$QUEUE.tmp" "$QUEUE"
+  printf '%s\n' "$t"
+}
+
+cmd_status() {
+  local pend=0
+  if [ -s "$QUEUE" ]; then pend=$(grep -c . "$QUEUE" 2>/dev/null | head -1); pend=${pend:-0}; else pend=0; fi
+  local usados=0 ultima=0
+  if [ -f "$BUDGET" ]; then
+    usados=$(python3 -c "
+import json,sys
+try:
+    d=json.load(open('$BUDGET'))
+    print(d.get('count',0) if int(d.get('hour',0))==int($now//3600) else 0)
+except Exception: print(0)
+" 2>/dev/null)
+    ultima=$(python3 -c "
+import json
+try: print(json.load(open('$BUDGET')).get('last',0))
+except Exception: print(0)
+" 2>/dev/null)
+  fi
+  echo "auto-wake: fila=$pend | wakes nesta hora=$usados/$MAX_PER_HOUR | ultimo ha $(( (now-ultima)/60 ))min"
+  [ "$pend" -gt 0 ] && sed 's/^/  - /' "$QUEUE" | head -5
+  return 0
+}
+
+cmd_budget() {
+  # 0 = pode; 1 = nao (orcado exhausted ou gap curto)
+  python3 - "$BUDGET" "$now" "$MAX_PER_HOUR" "$MIN_GAP_MIN" <<'PY'
+import json, os, sys
+path, now, mx, gap = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+d = {"count": 0, "hour": now // 3600, "last": 0}
+try:
+    d = json.load(open(path))
+except Exception:
+    pass
+if int(d.get("hour", 0)) != now // 3600:
+    d = {"count": 0, "hour": now // 3600, "last": d.get("last", 0)}
+if d.get("count", 0) >= mx:
+    print("BLOQUEADO")
+    sys.exit(1)
+if now - int(d.get("last", 0)) < gap * 60:
+    print("BLOQUEADO")
+    sys.exit(1)
+d["count"] = d.get("count", 0) + 1
+d["last"] = now
+json.dump(d, open(path, "w"))
+print("OK")
+sys.exit(0)
+PY
+}
+
+case "${1:-status}" in
+  enqueue) shift; cmd_enqueue "$*" ;;
+  next) cmd_next ;;
+  status) cmd_status ;;
+  budget) cmd_budget ;;
+  limit) echo "max por hora: ${2:-$MAX_PER_HOUR}" ;;
+  *) cmd_status ;;
+esac

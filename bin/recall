@@ -1,0 +1,119 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""recall - consulta a memoria episodica da frota NO LINUX (Qdrant hibrido).
+
+POR QUE EXISTE: o Linux mantem um RAG de verdade (qdrant 6333 + embeddings 8081
++ reranker 8082, expostos por `coord_recall`). Medido 12/11: 0,2 s do celular.
+Construir embeddings aqui seria pior em tudo (5,4 GB de RAM, sem llama.cpp) —
+o certo e' CONSUMIR o do host e imprimir so o que interessa.
+
+    recall "decisao do dono"           # 5 resultados compactos
+    recall "wake direct" --n 10
+    recall "rtk" --json
+    recall --ajuda
+
+COMPACTO DE PROPOSITO: score + data + texto em 1 linha. O MCP devolve JSON
+grande; despejar isso no contexto anula o ganho de ter um RAG.
+
+Se o host estiver fora (tailnet caida), sai 3 e diz o motivo — nao inventa.
+"""
+import argparse
+import datetime as dt
+import json
+import sys
+import urllib.request
+
+URL = "http://${TA_LINUX_IP4:-100.121.100.103}:8765/mcp"
+TIMEOUT = 20
+
+
+def rpc(payload, sid=None):
+    h = {"Content-Type": "application/json",
+         "Accept": "application/json, text/event-stream"}
+    if sid:
+        h["Mcp-Session-Id"] = sid
+    req = urllib.request.Request(URL, data=json.dumps(payload).encode(),
+                                 headers=h, method="POST")
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        return resp.headers.get("Mcp-Session-Id") or sid, resp.read().decode("utf-8", "ignore")
+
+
+def parse(corpo):
+    for linha in corpo.splitlines():
+        if linha.startswith("data:"):
+            try:
+                return json.loads(linha[5:].strip())
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        return json.loads(corpo)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def consultar(termo, n):
+    sid, _ = rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                  "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                             "clientInfo": {"name": "recall-termux", "version": "1"}}})
+    try:
+        rpc({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, sid)
+    except Exception:  # noqa: BLE001
+        pass
+    _, corpo = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "coord_recall",
+                               "arguments": {"query": termo, "top_k": n}}}, sid)
+    d = parse(corpo)
+    if "error" in d:
+        raise RuntimeError(str(d["error"])[:160])
+    res = d.get("result", {})
+    texto = "".join(i.get("text", "") for i in res.get("content", []))
+    if res.get("isError"):
+        raise RuntimeError(texto[:160] or "coord_recall devolveu erro")
+    texto = texto.strip()
+    return json.loads(texto) if texto.startswith("[") else []
+
+
+def data(ts):
+    try:
+        return dt.datetime.fromtimestamp(float(ts)).strftime("%d/%m")
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(
+        prog="recall", description="consulta a memoria episodica do Linux (Qdrant)",
+        epilog='ex.: recall "wake direct" --n 10')
+    ap.add_argument("termo", nargs="*")
+    ap.add_argument("--n", type=int, default=5)
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+
+    if not a.termo:
+        print(__doc__)
+        return 2
+    termo = " ".join(a.termo)
+
+    try:
+        itens = consultar(termo, a.n)
+    except Exception as e:  # noqa: BLE001
+        print("host fora ou coord-mcp mudo: %s" % str(e)[:120], file=sys.stderr)
+        print("(o RAG vive no Linux; sem tailnet nao ha recall)", file=sys.stderr)
+        return 3
+
+    if a.json:
+        print(json.dumps(itens, ensure_ascii=False, indent=1))
+        return 0 if itens else 1
+    if not itens:
+        print("nada na memoria sobre \"%s\"" % termo)
+        return 1
+    for it in itens:
+        txt = " ".join(str(it.get("text", "")).split())
+        print("%.2f %s %s" % (it.get("score", 0), data(it.get("ts")), txt[:150]))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

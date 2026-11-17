@@ -1,0 +1,274 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""pendencia - o que espera DECISAO do dono, empurrado ate ele (sem abrir o app).
+
+O `decidir` cria a pergunta e o botao. O `pendencia` e' o cobrador: olha as
+decisoes abertas e, quando ha algo parado, manda UMA notificacao agregada na
+tela de bloqueio — com botao de adiar. Nada de 8 notificacoes por hora: tem
+cooldown e adiamento de verdade.
+
+    pendencia                 # resumo em 1 linha (uso no terminal)
+    pendencia --lembrar       # notifica se houver pendencia nova (respeita cooldown)
+    pendencia --desdobrar     # 1 notificacao por decisao, cada uma com seus botoes
+    pendencia --adiar [H]     # silencia por H horas (padrao 4)
+    pendencia --json
+
+REGRA ANTI-SPAM (medida): mesmo conjunto de perguntas so avisa 1x a cada 2 h;
+pergunta nova (assinatura diferente) avisa na hora. Adiar ganha de tudo.
+
+ESTADO: ~/.local/state/pendencia.json
+"""
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+BIN = os.path.join(HOME, "bin")
+DECISOES = os.path.join(HOME, ".local/state/decisoes")
+ESTADO = os.path.join(HOME, ".local/state/pendencia.json")
+NOTIF = "pendencia"
+COOLDOWN = 2 * 3600      # mesmo conjunto: 1 aviso a cada 2 h
+MAX_DESDOBRAR = 5
+
+
+def rodar(cmd, timeout=30):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except Exception as e:  # noqa: BLE001
+        return 1, "", str(e)
+
+
+def carregar_estado():
+    try:
+        with open(ESTADO, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def salvar_estado(d):
+    os.makedirs(os.path.dirname(ESTADO), exist_ok=True)
+    tmp = ESTADO + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, ensure_ascii=False, indent=1)
+    os.replace(tmp, ESTADO)
+
+
+def pendentes():
+    out = []
+    for arq in sorted(glob.glob(os.path.join(DECISOES, "*.json"))):
+        try:
+            with open(arq, encoding="utf-8") as fh:
+                d = json.load(fh)
+        except Exception:  # noqa: BLE001
+            continue
+        if d.get("estado") == "pendente":
+            out.append(d)
+    return out
+
+
+def fechar_obsoletas(ds):
+    """Fecha perguntas cuja PREMISSA mudou sozinha.
+
+    MEDIDO 13/11: a pergunta 'ligue o carregador do celular' continuou
+    pendente (e seria re-cobrada aqui a cada 30 min) DEPOIS de o carregador
+    estar ligado — o dono ia ser perseguido por uma pergunta que ja nao
+    valia. Com 'condicao' no decidir (um comando: exit 0 = a pergunta ainda
+    vale), a pergunta se fecha sozinha e a notificacao sai da tela.
+
+    Devolve (lista_das_que_sobraram, lista_das_fechadas).
+    """
+    sobram, fechadas = [], []
+    for d in ds:
+        cond = d.get("condicao")
+        if not cond:
+            sobram.append(d)
+            continue
+        rc, _, _ = rodar(["bash", "-lc", cond], timeout=45)
+        if rc == 0:
+            sobram.append(d)
+            continue
+        d["estado"] = "resolvida_sozinha"
+        d["resposta"] = "(a premissa da pergunta mudou — resolvida sozinha)"
+        d["respondida"] = dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            with open(os.path.join(DECISOES, "%s.json" % d["id"]), "w", encoding="utf-8") as fh:
+                json.dump(d, fh, ensure_ascii=False, indent=1)
+        except Exception:  # noqa: BLE001
+            pass
+        rodar(["termux-notification-remove", "dec-" + d["id"]], timeout=15)
+        fechadas.append(d)
+    return sobram, fechadas
+
+
+def assinatura(ds):
+    return ",".join(sorted(d["id"] for d in ds))
+
+
+def idade(d):
+    s = int(time.time()) - d.get("criada_epoch", int(time.time()))
+    if s < 3600:
+        return "%dmin" % max(0, s // 60)
+    if s < 86400:
+        return "%.1fh" % (s / 3600.0)
+    return "%dd" % (s // 86400)
+
+
+def avisar(msg):
+    rodar(["termux-toast", "-g", "middle", msg[:110]], timeout=10)
+
+
+def tirar_notificacao():
+    rodar(["termux-notification-remove", NOTIF], timeout=15)
+
+
+# -------------------------------------------------------------------- acoes
+def acao_resumo(args):
+    ds = pendentes()
+    if args.json:
+        print(json.dumps([{k: v for k, v in d.items()} for d in ds],
+                         ensure_ascii=False, indent=1))
+        return 0
+    if not ds:
+        print("nada esperando decisao.")
+        return 0
+    print("%d decisao(es) aberta(s):" % len(ds))
+    for d in ds:
+        print("  %s [%s] %s  -> %s" % (d["id"], idade(d), d["pergunta"][:80],
+                                       " / ".join(d["opcoes"][:3])))
+    return 0
+
+
+def acao_lembrar(args):
+    ds = pendentes()
+    est = carregar_estado()
+    agora = int(time.time())
+
+    # MEDIDO 13/11: perguntas cuja premissa mudou (o carregador ja foi ligado)
+    # nao podem continuar sendo cobradas. Fecha antes de notificar.
+    if ds:
+        ds, fechadas = fechar_obsoletas(ds)
+        for d in fechadas:
+            print("  %s fechou sozinha: %s" % (d["id"], d.get("resposta", "")))
+            try:
+                with open(LOG, "a", encoding="utf-8") as fh:
+                    fh.write("%s\t%s\t(premissa mudou)\t%s\n" % (
+                        dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), d["id"], d.get("pergunta", "")))
+            except Exception:  # noqa: BLE001
+                pass
+
+    if not ds:
+        tirar_notificacao()
+        est.update(assinatura="", ultimo_lembrete=0, adiado_ate=0)
+        salvar_estado(est)
+        return 0
+
+    if agora < est.get("adiado_ate", 0):
+        if not args.verboso:
+            return 0
+        print("adiado por mais %d min" % ((est["adiado_ate"] - agora) // 60))
+        return 0
+
+    assin = assinatura(ds)
+    if (assin == est.get("assinatura") and
+            agora - est.get("ultimo_lembrete", 0) < COOLDOWN and not args.forcar):
+        if not args.verboso:
+            return 0
+        print("mesmo conjunto, avisado ha %d min (cooldown %d min)"
+              % ((agora - est["ultimo_lembrete"]) // 60, COOLDOWN // 60))
+        return 0
+
+    n = len(ds)
+    titulo = "Crouton: %d decisao%s esperando" % (n, "" if n == 1 else "oes")
+    corpo = "\n".join("- [%s] %s" % (idade(d), d["pergunta"][:90]) for d in ds[:3])
+    if n > 3:
+        corpo += "\n(+%d)" % (n - 3)
+
+    p = os.path.join(BIN, "pendencia")
+    botoes = [("Ver cada uma", "%s --desdobrar" % p),
+              ("Adiar 4h", "%s --adiar 4" % p),
+              ("Adiar 12h", "%s --adiar 12" % p)]
+    cmd = ["termux-notification", "--id", NOTIF, "--title", titulo[:64],
+           "--content", corpo[:420], "--priority", "high", "--group", "decisoes"]
+    for i, (rot, acao) in enumerate(botoes, start=1):
+        cmd += ["--button%d" % i, rot, "--button%d-action" % i, acao]
+    rc, _, err = rodar(cmd, timeout=25)
+
+    est.update(assinatura=assin, ultimo_lembrete=agora)
+    salvar_estado(est)
+
+    if rc != 0:
+        print("notificacao falhou: %s" % (err or rc), file=sys.stderr)
+        return 2
+    print("%s (%d aberta(s))" % ("notificado" if not args.verboso else titulo, n))
+    return 0
+
+
+def acao_desdobrar(args):
+    ds = pendentes()
+    if not ds:
+        tirar_notificacao()
+        print("nada pendente — nada a desdobrar.")
+        return 0
+    # a agregada sai de cena: agora cada pergunta tem a sua
+    tirar_notificacao()
+    for d in ds[:MAX_DESDOBRAR]:
+        rc, out, err = rodar([os.path.join(BIN, "decidir"), "--renotificar", d["id"]],
+                             timeout=40)
+        print("  %s: %s" % (d["id"], out or err or rc))
+    if len(ds) > MAX_DESDOBRAR:
+        print("  (+%d ficaram de fora — responda estas e rode de novo)"
+              % (len(ds) - MAX_DESDOBRAR))
+    return 0
+
+
+def acao_adiar(args):
+    horas = args.horas if args.horas and args.horas > 0 else 4
+    ate = int(time.time()) + horas * 3600
+    est = carregar_estado()
+    est["adiado_ate"] = ate
+    est["ultimo_lembrete"] = int(time.time())
+    salvar_estado(est)
+    tirar_notificacao()
+    avisar("decisoes adiadas por %dh" % horas)
+    quando = dt.datetime.fromtimestamp(ate).strftime("%H:%M")
+    print("adiado por %dh (volta a lembrar depois das %s)" % (horas, quando))
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(
+        prog="pendencia", description="cobra do dono o que esta esperando decisao",
+        epilog="ex.: pendencia --lembrar   |   pendencia --desdobrar")
+    ap.add_argument("--lembrar", action="store_true", help="notifica (respeita cooldown)")
+    ap.add_argument("--desdobrar", action="store_true", help="1 notificacao por decisao")
+    ap.add_argument("--adiar", nargs="?", const=4, type=int, default=None,
+                    metavar="H", help="silencia por H horas (padrao 4)")
+    ap.add_argument("--horas", type=int, default=None)
+    ap.add_argument("--forcar", action="store_true", help="ignora o cooldown")
+    ap.add_argument("--verboso", action="store_true", help="explica quando nao notifica")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+
+    if a.adiar is not None:
+        a.horas = a.adiar
+        return acao_adiar(a)
+    if a.desdobrar:
+        return acao_desdobrar(a)
+    if a.lembrar:
+        return acao_lembrar(a)
+    return acao_resumo(a)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

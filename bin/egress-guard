@@ -1,0 +1,60 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# egress-guard — impede que o IP público do dono vaze em qualquer teste de rede.
+#
+# PROBLEMA QUE ELE EVITA: VPN/UDP direto do celular sai pelo IP residencial.
+# Qualquer teste que dependa de anonymity (Tor, proxy, proxychains) precisa
+# sair pela cadeia correta — nunca pelo link normal do celular.
+#
+#   egress-guard                  # so diagnostico (imprime a rota efetiva)
+#   egress-guard --check          # sai com 1 se o trafego NAO esta protegido
+#   egress-guard --run "cmd ..."  # roda o comando SO se a rota estiver protegida
+#
+# Criterio de "protegido":
+#   - socks5 em 127.0.0.1:9050 (Tor) configurado no proxychains, OU
+#   - rota default via tun0 (Tailscale nao protege de IP publico: so protege de rota),
+#     com proxy SOCKS ativo, OU
+#   - o comando pedido usa proxychains4 / --proxy explicitamente.
+#
+# Regra do dono: NUNCA testar credencial/serviço externo expondo o IP residencial.
+set -uo pipefail
+export PATH="$HOME/bin:$PREFIX/bin:$PATH"
+
+MODE="diag"
+CMD=""
+if [ "${1:-}" = "--check" ]; then MODE="check"; shift
+elif [ "${1:-}" = "--run" ]; then MODE="run"; shift; CMD="$*"; fi
+
+tor_port() { timeout 5 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/9050" 2>/dev/null && echo UP || echo DOWN; }
+prox() { cat "$HOME/.proxychains.conf" 2>/dev/null | grep -iE "socks[45]|127\.0\.0\.1" | head -2 | tr '\n' ' '; }
+via_proxychains() { echo "$CMD" | grep -qE "proxychains4|proxychains"; }
+
+tor=$(tor_port)
+pc=$(prox)
+default_route=$(ip route show default 2>/dev/null | head -1)
+prot=0
+reason="sem rota protegida"
+
+if [ "$tor" = "UP" ] && echo "$pc" | grep -qiE "socks[45].*9050|127\.0\.0\.1.*9050"; then
+  prot=1; reason="Tor (9050) + proxychains configurado"
+elif via_proxychains; then
+  prot=1; reason="comando via proxychains"
+elif [ -n "$default_route" ] && echo "$default_route" | grep -q "tun0"; then
+  prot=1; reason="rota default via tun0 (Tailscale) — ainda assim prefira Tor para anonymity"
+fi
+
+echo "egress-guard: tor=$tor | rota-default=[${default_route:-nenhuma}] | proxychains=[${pc:-nenhum}]"
+echo "egress-guard: protegido=$prot ($reason)"
+
+case "$MODE" in
+  check) [ "$prot" = "1" ] || { echo "egress-guard: ABORTADO — trafego sairia pelo IP residencial" >&2; exit 1; } ;;
+  run)
+    if [ "$prot" != "1" ]; then
+      echo "egress-guard: ABORTADO — nao vou rodar '$CMD' expondo o IP residencial" >&2
+      echo "dica: use proxychains4 -f ~/.proxychains.conf <cmd> (Tor) ou ative o Tor" >&2
+      exit 1
+    fi
+    echo "egress-guard: rodando com protecao ($reason)"
+    exec bash -c "$CMD"
+    ;;
+esac
+exit 0

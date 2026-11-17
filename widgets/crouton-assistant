@@ -1,0 +1,27 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-assistant - abre o assistente (que usa o OpenCode do aparelho) por voz.
+# Fala a resposta em portugues do Brasil.
+
+set -uo pipefail
+export PATH="$PATH:$HOME/bin"
+
+say() { printf '%s\n' "$*"; }
+
+if ! command -v termux-dialog >/dev/null 2>&1; then
+  say "Termux:API ausente (pkg install termux-api)"
+  exit 1
+fi
+
+title="Assistente Termux"
+hint="Como posso ajudar?"
+raw=$(termux-dialog speech -i "$hint" -t "$title" 2>/dev/null)
+fala=$(printf '%s' "$raw" | jq -r '.text // empty' 2>/dev/null)
+[[ -z "$fala" ]] && { say "(sem entrada de voz)"; exit 0; }
+
+say "perguntei: $fala"
+resp=$(timeout 200 "$HOME/bin/assistant" --quiet --no-tts "$fala" 2>/dev/null)
+[[ -z "$resp" ]] && resp="(sem resposta)"
+say ""
+say "$resp"
+termux-toast "$(printf '%s' "$resp" | head -c 160)" >/dev/null 2>&1 || true
+termux-tts-speak -l pt-br "$(printf '%s' "$resp" | sed 's/[.,!?;:]/ /g' | head -c 400)" >/dev/null 2>&1 || true

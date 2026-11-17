@@ -1,0 +1,78 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-bus - estado do barramento de coordenacao (issue #12 do mt5) na tela inicial.
+# Mostra: a ultima mensagem de cada agente e o que esta endereçado a mim.
+
+set -uo pipefail
+export PATH="$PATH:$HOME/bin"
+REPO="Kuchiriel/mt5"
+ISSUE=12
+
+say() { printf '%s\n' "$*"; }
+
+if ! command -v gh >/dev/null 2>&1; then
+  say "gh nao instalado (sem acesso ao barramento)"
+  exit 1
+fi
+if ! gh auth status >/dev/null 2>&1; then
+  say "gh sem sessao: rode 'gh auth login'"
+  exit 1
+fi
+
+# a issue passou de 100 comentarios: tem que ler a ULTIMA pagina (page=1 traz os antigos)
+TOTAL=$(timeout 30 gh api "repos/$REPO/issues/$ISSUE" -q .comments 2>/dev/null || echo 0)
+PAGE=$(( (${TOTAL:-100} - 1) / 100 + 1 )); [ "$PAGE" -lt 1 ] && PAGE=1
+raw=$(timeout 60 gh api "repos/$REPO/issues/$ISSUE/comments?per_page=100&page=$PAGE" -q '.[].body' 2>/dev/null)
+# historico completo (ate 5 paginas) para nao perder mensagens antigas endereçadas a mim
+all=""
+for p in $(seq 1 5); do
+  b=$(timeout 60 gh api "repos/$REPO/issues/$ISSUE/comments?per_page=100&page=$p" -q '.[].body' 2>/dev/null)
+  [ -z "$b" ] && break
+  all="$all
+$b"
+done
+if [[ -z "$raw" ]]; then
+  say "nao consegui ler o barramento (rede/gh?)"
+  exit 1
+fi
+
+printf '%s' "$raw" > /data/data/com.termux/files/usr/tmp/opencode/bus-bodies.json
+
+python3 - <<'PY'
+import json, re
+raw = open("/data/data/com.termux/files/usr/tmp/opencode/bus-bodies.json", encoding="utf-8", errors="ignore").read()
+estados, meus = {}, []
+for bloco in raw.split("```coord-json"):
+    m = re.search(r"(\{.*?\})\s*```", bloco, re.S)
+    if not m:
+        continue
+    try:
+        d = json.loads(m.group(1))
+    except Exception:
+        continue
+    agente = d.get("agent") or "?"
+    estados[agente] = d
+    if d.get("to") == "crouton-alpha":
+        meus.append((d.get("ts") or "", (d.get("note") or d.get("intent") or "").replace("\n", " ")))
+
+print("== barramento: ultimo estado de cada agente ==")
+for a, d in sorted(estados.items(), key=lambda kv: kv[1].get("ts") or "", reverse=True):
+    kind = d.get("kind") or "-"
+    lane = d.get("lane") or "-"
+    ts = (d.get("ts") or "")[:19]
+    what = (d.get("intent") or d.get("note") or "-").replace("\n", " ")
+    if len(what) > 110:
+        what = what[:110] + "..."
+    print("• {:18s} {:8s} {:22s} {}".format(a, kind, lane, ts))
+    if what != "-":
+        print("    " + what)
+    to = d.get("to") or ""
+    if to:
+        print("    -> " + to)
+
+print("")
+print("--- enderecado a crouton-alpha ---")
+if not meus:
+    print("(nada enderecado a mim)")
+for ts, n in sorted(meus, reverse=True)[:3]:
+    print("• [{}] {}".format(ts[:19], n[:190]))
+PY

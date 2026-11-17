@@ -1,3 +1,7 @@
-*.log
-config.env
 .env
+*.token
+*.key
+*.log
+__pycache__/
+*.pyc
+.ta-backup-*

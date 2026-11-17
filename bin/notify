@@ -1,0 +1,96 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# notify - avisa o dono no celular (e opcionalmente no Telegram via Linux).
+#
+#   notify "mensagem"              # notificação nativa do Android (Termux:API)
+#   notify "msg" --telegram        # relay Telegram (coord_notify no coord-mcp do Linux)
+#   notify "msg" --priority high   # baixa/alta (default high)
+#   notify "msg" --title "Titulo" --telegram --native
+#   notify "msg" --id meu-slot     # atualiza SEMPRE o mesmo slot (nao empilha)
+#
+# POR QUE EXISTE: o `ntfy publish` nos hooks falhava em SILENCIO (o CLI ntfy nao esta
+# no PATH do Termux — so o app Android esta). Agora: Termux:API (nativo, sem internet)
+# + ntfy (se houver CLI) + Telegram (se o dono pedir/para avisos de fleet).
+#
+# ANTI-FLOOD (medido 13/11/2026): sem `--id`, o Termux:API gera um UUID por chamada
+# e cada aviso vira uma notificacao NOVA — o heartbeat/night-shift notificando de
+# 15/30 em 30 min encheram a gaveta com 37 copias. Agora:
+#   - `--title` recorrente  -> id estavel derivado do titulo (atualiza no lugar)
+#   - sem `--title` (aviso pontual) -> id derivado do hash da mensagem (nao se perde)
+#   - `--id` explicito manda em tudo. `--new` forca slot novo (alerta de verdade).
+# Ao atualizar um slot recorrente usamos `--alert-once`: o Android nao vibra/toca
+# de novo so porque o texto envelheceu ("fora ha 11min" -> "fora ha 41min").
+set -uo pipefail
+export PATH="$HOME/bin:$PREFIX/bin:$PATH"
+
+MSG=""
+TITLE="Crouton Alpha"
+PRIO="high"
+USE_TG=0
+USE_NATIVE=1
+USE_NTFY=1
+NOTIF_ID=""
+ALERT_ONCE=0
+FORCE_NEW=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --telegram) USE_TG=1; shift ;;
+    --no-native) USE_NATIVE=0; shift ;;
+    --no-ntfy) USE_NTFY=0; shift ;;
+    --title) TITLE="$2"; shift 2 ;;
+    --priority) PRIO="$2"; shift 2 ;;
+    --id) NOTIF_ID="$2"; shift 2 ;;
+    --alert-once) ALERT_ONCE=1; shift ;;
+    --new) FORCE_NEW=1; shift ;;
+    -*) shift ;;
+    *) if [ -z "$MSG" ]; then MSG="$1"; else MSG="$MSG $1"; fi; shift ;;
+  esac
+done
+[ -z "$MSG" ] && { echo "uso: notify \"mensagem\" [--telegram] [--title T] [--priority p] [--id slot] [--new]"; exit 2; }
+
+# id estavel: mesmo titulo = mesmo slot (atualiza); mensagem pontual sem titulo =
+# hash do texto (avisos diferentes nao se sobrescrevem).
+if [ -z "$NOTIF_ID" ] && [ "$FORCE_NEW" = "0" ]; then
+  if [ "$TITLE" = "Crouton Alpha" ]; then
+    _h=$(printf '%s' "$MSG" | sha256sum | cut -c1-10)
+    NOTIF_ID="crouton-msg-$_h"
+  else
+    _slug=$(printf '%s' "$TITLE" | LC_ALL=C tr -c 'A-Za-z0-9' '-' | sed 's/--*/-/g; s/^-//; s/-$//' | cut -c1-40)
+    NOTIF_ID="crouton-${_slug:-alerta}"
+    ALERT_ONCE=1
+  fi
+elif [ "$FORCE_NEW" = "1" ]; then
+  NOTIF_ID="crouton-$(date +%s)-$$"
+fi
+
+# prioridade Termux:API: 0=min 1=low 2=default 3=high 4=max
+case "$PRIO" in
+  min) TP=0;; low) TP=1;; default) TP=2;; high) TP=3;; max) TP=4;; *) TP=3;;
+esac
+
+rc=0
+
+# 1) notificacao NATIVA do Android (funciona offline, sem servidor)
+if [ "$USE_NATIVE" = "1" ] && command -v termux-notification >/dev/null 2>&1; then
+  _args=(--title "$TITLE" --priority "$TP" --content "$MSG" --id "$NOTIF_ID")
+  [ "$ALERT_ONCE" = "1" ] && _args+=(--alert-once)
+  termux-notification "${_args[@]}" >/dev/null 2>&1 \
+    && echo "notify: nativo OK (id=$NOTIF_ID)" || { echo "notify: nativo FALHOU"; rc=1; }
+fi
+
+# 2) ntfy (so se o CLI existir — hoje nao existe no Termux)
+if [ "$USE_NTFY" = "1" ] && command -v ntfy >/dev/null 2>&1; then
+  timeout 20 ntfy publish --priority="$PRIO" "crouton-alerta" "$MSG" >/dev/null 2>&1 \
+    && echo "notify: ntfy OK" || { echo "notify: ntfy FALHOU"; rc=1; }
+fi
+
+# 3) Telegram via o coord-mcp do Linux (o TOKEN fica no Linux)
+if [ "$USE_TG" = "1" ]; then
+  out=$(timeout 90 "$HOME/bin/coord-cli" notify "$MSG" 2>&1 | tail -1)
+  case "$out" in
+    *falhou*) echo "notify: telegram FALHOU ($out)"; rc=1 ;;
+    *) echo "notify: telegram OK" ;;
+  esac
+fi
+
+exit $rc

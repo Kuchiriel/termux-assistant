@@ -1,0 +1,20 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-sessions - lista as sessoes recentes do OpenCode (a do agente inclusive).
+
+set -uo pipefail
+say() { printf '%s\n' "$*"; }
+
+data=$(opencode api GET /api/session 2>/dev/null)
+if [[ -z "$data" ]]; then
+  say "nao consegui falar com o servico do OpenCode"
+  exit 1
+fi
+
+printf '%s' "$data" | jq -r '
+  (.data // .)
+  | sort_by(.time.updated // .time.created // 0) | reverse
+  | .[0:8][]
+  | "• \(.id)\n  \(.title // "(sem titulo)")  [\((.time.updated // .time.created) / 1000 | strftime("%d/%m %H:%M"))]"' 2>/dev/null
+
+say ""
+say "para retomar: opencode --session <id>"

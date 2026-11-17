@@ -1,0 +1,10 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-anota - anota uma ideia por VOZ (cai no teclado se a fala falhar).
+# Toque no widget > fale. A nota fica em ~/notes/inbox.jsonl com hora.
+set -uo pipefail
+export PATH="$HOME/bin:$PREFIX/bin:$PATH"
+clear
+"$HOME/bin/anota" --falar
+echo
+echo "--- ultimas notas:"
+"$HOME/bin/anota" --listar 3

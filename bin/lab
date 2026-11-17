@@ -1,0 +1,50 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# lab — o laboratório A/B do nitro-v15, comandado do celular.
+#
+# Uso: lab status | doctor | run [L1|L2|L3] | level Lx | arm b|m|a | pause |
+#      resume | stop | restart | logs [N] | gpu | checkers
+#
+# O laboratório roda TODO no Linux. Este wrapper só leva o comando por SSH.
+# LAB_TIMEOUT controla o prazo total (default 900s, pois uma medição pode
+# passar de 60s). O fallback LAN só ocorre quando o transporte IPv6 não
+# conecta; um timeout NUNCA reexecuta o comando, pois ele pode continuar
+# ativo no host.
+set -uo pipefail
+
+HOST6='${TA_LINUX_HOST6:-fd7a:115c:a1e0::7f01:64bd}'
+HOST4='${TA_LINUX_LAN:-192.168.15.10}'
+USERH='nixos'
+REPO='projects/nixos-ai'
+LAB_TIMEOUT="${LAB_TIMEOUT:-900}"
+CONNECT_TIMEOUT="${LAB_CONNECT_TIMEOUT:-8}"
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    echo "uso: lab status|doctor|run [L1|L2|L3]|level Lx|arm b|m|a|pause|resume|stop|restart|logs [N]|gpu|checkers"
+    echo "env: LAB_TIMEOUT=${LAB_TIMEOUT}s CONNECT_TIMEOUT=${CONNECT_TIMEOUT}s"
+    exit 0
+fi
+
+cmd="cd ~/$REPO && bash scripts/lab.sh"
+for a in "$@"; do
+    cmd+=" $(printf '%q' "$a")"
+done
+
+# Probe sem efeito: se IPv6 nao conecta, usamos LAN. Se conecta e a
+# execucao cai depois, nao repetimos via LAN para nao duplicar o comando.
+if timeout 15 ssh -6 -o ConnectTimeout="$CONNECT_TIMEOUT" -o BatchMode=yes "$USERH@$HOST6" true >/dev/null 2>&1; then
+    OUT=$(timeout "$LAB_TIMEOUT" ssh -6 -o ConnectTimeout="$CONNECT_TIMEOUT" -o BatchMode=yes "$USERH@$HOST6" "$cmd" 2>&1)
+    RC=$?
+    if [ "$RC" -eq 124 ]; then
+        echo "(lab excedeu ${LAB_TIMEOUT}s; o comando pode continuar no host; fallback LAN NAO foi tentado)" >&2
+    elif [ "$RC" -eq 255 ]; then
+        echo "(transporte IPv6 caiu durante o comando; fallback LAN NAO foi tentado para evitar duplicacao)" >&2
+    fi
+else
+    echo "(tailnet nao respondeu; tentando LAN $HOST4)" >&2
+    OUT=$(timeout "$LAB_TIMEOUT" ssh -4 -o ConnectTimeout="$CONNECT_TIMEOUT" -o BatchMode=yes "$USERH@$HOST4" "$cmd" 2>&1)
+    RC=$?
+    [ "$RC" -eq 124 ] && echo "(lab excedeu ${LAB_TIMEOUT}s via LAN; o comando pode continuar no host)" >&2
+fi
+
+printf '%s\n' "$OUT"
+exit "$RC"

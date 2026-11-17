@@ -1,0 +1,322 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# owner-brief - o resumo do que PRECISA do dono, em 1 tela.
+#
+# O dono dorme; a frota trabalha. Quando ele volta, esta e a primeira coisa a ler:
+# o que ficou esperando DECISAO dele (nao o que a maquina fez).
+#
+#   owner-brief          # 1 tela local (topico a topico)
+#   owner-brief --post   # publica no bus um RESUMO SEM DADOS PESSOAIS
+#   owner-brief --help   # ajuda
+set -uo pipefail
+export PATH="$HOME/bin:$PREFIX/bin:$PATH"
+
+usage() {
+  cat <<'EOF'
+Uso:
+  owner-brief            mostra o brief local completo
+  owner-brief --post     mostra o brief e publica no bus apenas um resumo sem dados pessoais
+  owner-brief --help     mostra esta ajuda
+EOF
+}
+
+MODE="display"
+case "${1:-}" in
+  "") : ;;
+  --post) MODE="post" ;;
+  -h|--help) usage; exit 0 ;;
+  *) echo "owner-brief: opcao desconhecida: $1" >&2; usage >&2; exit 2 ;;
+esac
+[ "$#" -le 1 ] || { echo "owner-brief: Arguments extras nao sao aceitos" >&2; exit 2; }
+
+sep() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+item() { printf '  - %s\n' "$*"; }
+_sens_n=0
+_dec_n=0
+
+# MEDIDO 10/11: com o host carregado, o brief do dono ESTOURAVA (>280 s): as sondas
+# pesadas (phone-fs sensitive, coord_health, bus, oc-doctor) rodavam EM SERIE e
+# cada uma podia custar dezenas de segundos. Agora elas sao INICIADAS EM BACKGROUND
+# aqui e coletadas na secao correspondente — a ordem da tela continua a mesma.
+HB_TMP=$(mktemp -d 2>/dev/null || echo "$PREFIX/tmp/opencode/owner-brief")
+mkdir -p "$HB_TMP" 2>/dev/null
+( timeout 90 phone-fs sensitive --json > "$HB_TMP/sens.json" 2>/dev/null ) &
+( timeout 25 coord-cli health > "$HB_TMP/health" 2>/dev/null ) &
+( timeout 60 ~/bin/bus-post --who --last 10 > "$HB_TMP/bus" 2>/dev/null ) &
+( timeout 75 oc-doctor > "$HB_TMP/ocdoctor" 2>/dev/null ) &
+
+# SITUACAO AGORA (medido 09/11 05:4x): o celular PERDEU A TAILNET porque OUTRA VPN
+# tomou o slot do Android (uma VPN por vez). O modo degradado da frota funciona (bus
+# direto + notificacao), mas o coord-mcp e o relay (Linux -> celular, SSH 8022) ficam
+# fora ate o dono religar o Tailscale. Fica no topo porque e' a unica coisa que
+# derruba o acesso ao celular.
+tn_ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}' | grep -E '^100\.' | head -1)
+# SITUACAO AGORA — o PC do dono (host Linux): MEDIDO 11/11 o diagnostico por
+# PORTA tinha um furo FATAL: 3 portas fechadas eram lidas como 'o PC esta FORA
+# DO AR' e o brief mandava o dono LIGAR O PC. Mas porta mede ROTA, nao MAQUINA.
+# PROVA (2 canais, medidos): (a) o BUS tem 6 posts com host.kind=linux /
+# hostname=nitro-v15 entre 03:09:57Z e 03:13:05Z — o PC postou (dentro da
+# janela em que o brief dizia 'fora ha 18h'); (b) MagicDNS resolve nitro-v15
+# -> ${TA_LINUX_IP4:-100.121.100.103} (mesmo IP) e ping nao volta. => PC LIGADO, ROTA CAIDA.
+# Por isso o brief agora usa ~/bin/host-sinal (vida medida pelo bus, que
+# responde sem depender da tailnet) e distingue 3 estados:
+#   ACESSIVEL / VIVO-ROTA (PC de pe, rota caiu) / SEM-SINAL (pode estar apagado)
+_host_estado="?"
+_host_rotulo=""
+_host_vida=""
+_host_lan=0
+if [ -x "$HOME/bin/host-sinal" ]; then
+  _hs=$(timeout 90 "$HOME/bin/host-sinal" --json 2>/dev/null)
+  _host_estado=$(printf '%s' "$_hs" | python3 -c "
+import sys,json
+try: print(json.load(sys.stdin).get('estado','?'))
+except Exception: print('?')
+" 2>/dev/null)
+  _host_rotulo=$(printf '%s' "$_hs" | python3 -c "
+import sys,json
+try: print(json.load(sys.stdin).get('rotulo',''))
+except Exception: pass
+" 2>/dev/null)
+  _host_vida=$(printf '%s' "$_hs" | python3 -c "
+import sys,json
+try:
+    v=json.load(sys.stdin).get('vida_min')
+    print(' (ha %s min)' % v if v else '')
+except Exception: pass
+" 2>/dev/null)
+  _host_lan=$(printf '%s' "$_hs" | python3 -c "
+import sys,json
+try: print('1' if json.load(sys.stdin).get('lan_aberta') else '0')
+except Exception: print('0')
+" 2>/dev/null)
+fi
+if [ "$_host_estado" = "VIVO-ROTA" ]; then
+  if [ "${_host_lan:-0}" = "1" ]; then
+    sep "0) SITUACAO AGORA — PC LIGADO; TAILNET CELULAR→PC CAÍDA"
+    item "MEDIDO AGORA: o SSH responde via LAN ${TA_LINUX_LAN:-192.168.15.10}:22; o PC NAO esta fora do ar."
+    item "A rota ${TA_LINUX_IP4:-100.121.100.103} falha apenas do celular para o PC (assimetrica); PC→celular OK."
+    item "A frota usa tunel SSH automatico pela LAN em ~/bin/mcp; coord-mcp direto pela tailnet"
+    item "fica indisponivel, mas as ferramentas do PC funcionam."
+    item "O QUE PRECISA DE VOCE: nenhuma acao para ligar o PC agora; fica so o reparo futuro"
+    item "do endpoint/rota da tailnet celular→PC."
+  else
+    sep "0) SITUACAO AGORA — O SEU PC ESTA LIGADO, MAS A ROTA CAIU"
+    item "MEDIDO AGORA${_host_vida}: o PC Linux publicou no bus (host.kind=linux, hostname=nitro-v15)."
+    item "ENTAO O PC NAO ESTA APAGADO — o que nao responde sao as 3 portas (22 SSH, 4599 API, 8765"
+    item "coord-mcp) pela tailnet. A maquina esta de pe; o CAMINHO ate ela que caiu."
+    item "O QUE ISSO TRAZ: o coord-mcp (roster/pessoas/lessons) e o relay de arquivos (PC ->"
+    item "celular) ficam indisponiveis, e o celular vira o no que mede a frota. A frota do"
+    item "Linux continua viva: ela publica no bus por cima do GitHub (canal que nao depende"
+    item "da tailnet) e o heartbeat continua medindo por ele."
+    item "O QUE PRECISA DE VOCE (no PC, 1 comando): religar a tailnet de la —"
+    item "    sudo systemctl restart tailscaled"
+    item "GATILHO CONHECIDO (post-mortem 09/11, ai-mesh/docs/postmortem-protonvpn-tailscale-09-11.md):"
+    item "e' o ProtonVPN assumindo a rota default no host (rebind-default-route-change). Se ele"
+    item "estiver aberto, feche a GUI antes: pkill -f protonvpn-app  (o ProtonVPN nao e' mais"
+    item "necessario no host: o relay ja usa a cadeia Tor -> SNX, que nao toca na rota default)."
+    item "Se o Tailscale do PC pedir novo login, e' 1 toque no link. Se o PC estava desligado"
+    item "desde antes, e' so ligar (o heartbeat re-amarra o sshd do celular sozinho)."
+  fi
+elif [ "$_host_estado" = "SEM-SINAL" ]; then
+  sep "0) SITUACAO AGORA — O SEU PC LINUX ESTA FORA DO AR"
+  _ha_quando=""
+  if [ -f "$HOME/.local/state/host-down-since" ]; then
+    _ha_quando=" (ha $(( ($(date +%s) - $(cat "$HOME/.local/state/host-down-since")) / 60 )) min)"
+  fi
+  item "MEDIDO AGORA${_ha_quando}: as 3 portas do PC (22 SSH, 4599 API do opencode, 8765 coord-mcp)"
+  item "estao sem resposta E o PC nao publica no bus ha mais de 360 min (3 h) — este e' o unico caso"
+  item "em que 'o PC esta apagado' e' a leitura correta."
+  item "O QUE ISSO TRAZ: a frota esta rodando SO no celular (bus direto + este brief), o"
+  item "relay de arquivos (PC -> celular) esta indisponivel e o coord-mcp nao responde."
+  item "O QUE PRECISA DE VOCE: ligar o PC (ou verificar se ele esta sem energia/rede). Quando"
+  item "volver, o heartbeat re-amarra o sshd do celular e a frota se recompoe sozinha."
+  echo
+elif [ "$_host_estado" = "ACESSIVEL" ]; then
+  : # host respondendo: nada a abrir no topo
+elif [ -z "$tn_ip" ]; then
+  sep "0) SITUACAO AGORA — ACAO DO DONO (1 comando no celular)"
+  item "O CELULAR ESTA SEM TAILNET: outra VPN (com.tailscale.ipn e ch.protonvpn.android"
+  item "instalados) tomou o slot do Android — so uma VPN por vez. MEDIDO: a interface da"
+  item "tailnet sumiu e sobrou tun0 (10.2.0.2/32) com a rota default."
+  item "O QUE CAIU: coord-mcp :8765, sshd 8022 e o relay do phone-fs (o Linux nao le os"
+  item "arquivos do celular). A frota continua no bus direto e o heartbeat ja te avisou."
+  item "O QUE PRECISA DE VOCE: desligar a outra VPN e religar o Tailscale. Depois disso"
+  item "o sshd se re-amarra sozinho (ele descobre o IP atual e refaz o bind)."
+  item "Se voce PRECISA da outra VPN agora, a ordem e' a mesma: o Android nao deixa as"
+  item "duas ao mesmo tempo — e a frota nao depende de internet, so do canal do bus."
+fi
+
+sep "1) DECISOES QUE SO O DONO PODE TOMAR"
+# propostas phone-fs (movimento de arquivo: sempre revisado por human)
+n=0
+sens=""
+if command -v phone-fs >/dev/null 2>&1; then
+  n=$(timeout 60 phone-fs plans 2>/dev/null | grep -c 'proposto')
+  if [ "${n:-0}" -gt 0 ]; then
+    item "$n proposta(s) de organizacao de arquivo pendentes (NADA foi movido):"
+    timeout 60 phone-fs plans 2>/dev/null | grep 'proposto' | sed 's/^/      /' | head -5
+    item "para aplicar: phone-fs apply <plan_id> --yes   (vai pra QUARENTENA, reversivel)"
+  else
+    item "nenhuma proposta de arquivo pendente"
+  fi
+  # itens de RISCO no storage (chave privada, export de senhas, config SSH...):
+  # o storage COMPARTILHADO e' legivel por qualquer app com permissao -> so o
+  # dono pode decidir (mover? revogar? deletar?). So metadados, nenhum conteudo.
+  sens=$(cat "$HB_TMP/sens.json" 2>/dev/null | python3 -c "
+import sys,json
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit(0)
+for x in d.get('achados',[]):
+    if not x.get('compartilhado'): continue
+    extra=' (VAZIO)' if x.get('vazio') else ''
+    print('      %s | %s | %s%s' % (x['motivo'], x.get('nome') or x.get('name') or '?', x['path'], extra))
+" 2>/dev/null)
+  if [ -n "$sens" ]; then
+    item "itens sensiveis no storage COMPARTILHADO (legivel por qualquer app) — revisar:"
+    printf '%s\n' "$sens" | head -8
+    item "detalhe: phone-fs sensitive   (nao movi nada; decisao do dono)"
+  fi
+fi
+# CASO DO DONO: prazos que dependem de ACAO HUMANA (extraido dos docs no celular)
+caso="$HOME/docs/catalogo/caso-do-dono.txt"
+if [ -f "$caso" ]; then
+  item "CASO (prazo que depende de VOCE) — extracao dos documentos no celular:"
+  # MEDIDO 09/11: o limite de 12 linhas cortava o bloco do TRT (a linha
+  # 'PRECISA DE VOCE/ADVOGADO' ficava fora) — o corte agora e' por SECAO,
+  # ate a proxima linha em branco, para nada do caso sumir do brief.
+  awk 'NF{print} !NF && seen{exit} {if(NF) seen=1}' "$caso" | sed 's/^/      /'
+  # MEDIDO 09/11: a contagem "42 dias sem beneficio" estava ESCRITA no resumo e
+  # envelhecia em silencio (42 em 08/11, 43 em 09/11) — e era ambigua (o
+  # beneficio durou 62 dias). Agora a contagem e' CALCULADA na hora, a partir da
+  # data de cessacao, e nunca mais envelhece.
+  cess=$(grep -oE 'CESSACAO [0-9]{2}/[0-9]{2}/[0-9]{4}' "$caso" | head -1 | awk '{print $2}')
+  if [ -n "$cess" ]; then
+    dias=$(python3 -c "
+import datetime,sys
+try:
+    d=datetime.datetime.strptime('$cess','%d/%m/%Y').date()
+    h=datetime.date.today()
+    print((h-d).days)
+except Exception:
+    print('')
+" 2>/dev/null)
+    if [ -n "$dias" ]; then
+      item "  >>> CONTAGEM AO VIVO (calculada agora): $dias dias SEM beneficio ate hoje (cessacao $cess)."
+    fi
+  fi
+fi
+# coord_health: o que esta degradado
+if command -v coord-cli >/dev/null 2>&1; then
+  h=$(cat "$HB_TMP/health" 2>/dev/null)
+  if [ -n "$h" ]; then
+    rag=$(printf '%s' "$h" | grep -o '"rag_ok": [a-z]*' | head -1)
+    ram=$(printf '%s' "$h" | grep -A3 '"ram"' | grep -o '"available_gb": [0-9.]*' | head -1)
+    item "host Linux: ${rag:-rag nao medido} | RAM disponivel ${ram:-?}"
+  else
+    item "host Linux: nao medido (coord-mcp indisponivel via tailnet/LAN)"
+  fi
+fi
+# carga do host (via SSH, se houver chave)
+if timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=8 ${TA_LINUX_USER:-nixos}@${TA_LINUX_IP4:-100.121.100.103} 'cat /proc/loadavg' 2>/dev/null | head -1 | grep -q .; then
+  load=$(timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=8 ${TA_LINUX_USER:-nixos}@${TA_LINUX_IP4:-100.121.100.103} 'cut -d" " -f1-3 /proc/loadavg' 2>/dev/null)
+  item "carga do host: $load"
+fi
+# Telegram (relay pro dono) e Windows (malha SSH): ultimo estado conhecido;
+# o host esta fora, portanto NAO foram revalidados agora.
+item "relay de Telegram (ultimo estado conhecido, nao revalidado agora): coord_notify falhou"
+item "malha SSH Windows (ultimo estado conhecido, nao revalidado agora): falta SSH + manifesto real"
+
+sep "2) O QUE A FROTA FEZ (ultimas horas, pelo bus)"
+cat "$HB_TMP/bus" 2>/dev/null | awk '{printf "  - %s\n", $0}' | cut -c1-150
+
+sep "3) SAUDE DO CELULAR"
+if command -v oc-doctor >/dev/null 2>&1; then
+  cat "$HB_TMP/ocdoctor" 2>/dev/null | grep -E "^\s+(ok|atencao|erro)|\[3[12]m" | sed 's/^/  /' | head -14
+fi
+
+sep "4) FILA / KANBAN"
+if command -v queue >/dev/null 2>&1; then
+  timeout 60 queue board 2>/dev/null | sed 's/^/  /' | head -16
+fi
+
+sep "5) FROTAS EM MOVIMENTO (atividade das sessoes no host)"
+# MEDIDO 10/11: com o host carregado, cada 'wake-direct --last' pode levar 90 s e
+# eles eram SERIAIS (4 agentes -> ate 6 min, e o brief do dono estourava). Agora
+# sao paralelos e com teto de 25 s.
+_ATIVOS_FALLBACK="Arara Onca Lince Cervo Falcao"
+ATIVOS=$(timeout 30 "$HOME/bin/coord-cli" roster 2>/dev/null \
+  | sed -n 's/^- \([^ ·]*\) ·.*/\1/p' \
+  | awk 'NF && !seen[$0]++' \
+  | tr '\n' ' ')
+[ -n "$ATIVOS" ] || ATIVOS="$_ATIVOS_FALLBACK"
+tmpdir="$HB_TMP"
+for a in $ATIVOS; do
+  ( ep=$(timeout 25 ~/bin/wake-direct --last "$a" 2>/dev/null | tail -1); rc=$?
+    printf '%s\t%s\t%s\n' "$a" "${ep:-}" "$rc" > "$tmpdir/ep-$(echo "$a" | tr -c 'A-Za-z0-9' '_')" ) &
+done
+wait
+for a in $ATIVOS; do
+  f="$tmpdir/ep-$(echo "$a" | tr -c 'A-Za-z0-9' '_')"
+  ep=$(cut -f2 "$f" 2>/dev/null); rc=$(cut -f3 "$f" 2>/dev/null)
+  case "${ep:-}" in
+    # MEDIDO 10/11: exit 124 = o teto de 25 s estourou (host lento) -> e' 'NAO
+    # MEDIDO', nao 'sem atividade'. Traduzir 'nao li' como 'sem atividade' e'
+    # mentir sobre a frota.
+    ''|*[!0-9]*) item "$a: sem leitura (host lento no SSH)" ;;
+    0) if [ "${rc:-0}" = "124" ]; then item "$a: nao medido (host lento no SSH)"; else item "$a: sessao sem atividade registrada"; fi ;;
+    *) item "$a: ativa ha $(( ($(date +%s) - ep) / 60 ))min" ;;
+  esac
+done
+rm -rf "$tmpdir" 2>/dev/null
+
+sep "6) O QUE PRECISA DE VOCE AGORA (medido)"
+_action_n=1
+_add_action() { item "$_action_n) $1"; _action_n=$((_action_n + 1)); }
+case "$_host_estado" in
+  SEM-SINAL) _add_action "verificar/ligar o PC Linux (sem sinal de vida no bus; secao 0)" ;;
+  VIVO-ROTA)
+    if [ "${_host_lan:-0}" != "1" ]; then
+      _add_action "religar a tailnet no PC Linux (a maquina posta, mas as portas nao respondem)"
+    fi
+    ;;
+  ACESSIVEL) : ;;
+esac
+if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+  _add_action "revisar ${n} proposta(s) de organizacao de arquivo (secao 1; nada foi movido)"
+fi
+if [ -n "$sens" ]; then
+  _sens_n=$(printf '%s\n' "$sens" | wc -l | tr -d ' ')
+  _add_action "revisar ${_sens_n} item(ns) sensivel(is) no storage COMPARTILHADO (secao 1; nada foi movido)"
+fi
+if [ "$_action_n" -eq 1 ]; then
+  item "nenhuma acao operacional medida fora das decisoes abertas da secao 7"
+fi
+
+# 7) DECISOES ABERTAS — a unica parte do brief que e' GERADA (nao hardcoded).
+# Fonte: ~/.local/state/decisoes (criadas por `decidir`). Se estiver vazio, o
+# dono nao tem nada esperando — e isso precisa aparecer dito, nao omitido.
+sep "7) DECISOES ABERTAS (respondiveis na tela de bloqueio)"
+if [ -x "$HOME/bin/pendencia" ]; then
+  _pend=$(timeout 25 "$HOME/bin/pendencia" 2>/dev/null)
+  _dec_n=$(printf '%s\n' "$_pend" | grep -Ec '^[[:space:]]*d[0-9]{4}' || true)
+  case "$_pend" in
+    ""|nada*) item "nenhuma." ;;
+    *)
+      printf '%s\n' "$_pend" | sed 's/^/  /'
+      item "responder: toque nos botoes da notificacao (ou: pendencia --desdobrar)"
+      ;;
+  esac
+else
+  item "pendencia: nao instalado"
+fi
+
+if [ "$MODE" = "post" ]; then
+  # O brief completo contem dados pessoais do caso. No bus vai so um resumo
+  # com contagens e estado; nenhum caminho, pergunta, beneficio ou documento.
+  _msg="OWNER BRIEF (resumo sem dados pessoais): host=${_host_estado:-?}; propostas=${n:-0}; sensiveis=${_sens_n:-0}; decisoes_abertas=${_dec_n:-0}; detalhes somente no celular."
+  if timeout 60 "$HOME/bin/bus-post" "$_msg" --kind status >/dev/null 2>&1; then
+    echo "owner-brief: resumo sem dados pessoais publicado no bus"
+  else
+    echo "owner-brief: FALHA ao publicar o resumo no bus" >&2
+    exit 1
+  fi
+fi

@@ -1,0 +1,71 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""cota-medir - mede o consumo real da cota (400/429) do gate do celular.
+
+    cota-medir           # resumo em texto
+    cota-medir --json    # saida em JSON
+    cota-medir --help
+
+POR QUE (medido 13/11 no celular):
+    O relatorio do dono dizia 'a cota continua queimando: medido 54x400 +
+    151x429 na ultima hora' — um numero DIGITADO que envelhece sozinho. E o
+    '400' ja nao existe mais (a correcao do body normalizado esta aplicada: 0
+    linhas com 400 no log inteiro do gate), enquanto o '429' continua: as
+    requisicoes que chegam tem 1,4 a 3,4 MB (mediana 2,33 MB) e o upstream
+    recusa. Alem disso, o script que o relatorio indica ('fix-freetier-input')
+    hoje e' NO-OP: responde 'nenhum modelo :free no config — nada a fazer'.
+
+    Este medidor diz o que esta acontecendo AGORA, a partir do log do gate
+    (o gate so registra AVISOS — nao ha linha de sucesso, entao a ausencia de
+    'OK' no log nao significa nada).
+
+So LE: nao faz request, nao gasta cota, nao mexe em nada.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+
+LOG = os.path.expanduser("~/.local/state/nv-gate-phone.log")
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--help", "-h", action="store_true")
+    a = ap.parse_args()
+    if a.help:
+        print(__doc__)
+        return 0
+
+    if not os.path.exists(LOG):
+        print("sem log do gate (%s)" % LOG)
+        return 0
+    txt = open(LOG, errors="ignore").read()
+    linhas = txt.splitlines()
+    n400 = len(re.findall(r"\b400\b", txt))
+    n429 = len(re.findall(r"WARN upstream 429", txt))
+    n502 = len(re.findall(r"WARN upstream 502", txt))
+    n503 = len(re.findall(r"WARN upstream 503", txt))
+    reset = len(re.findall(r"ConnectionReset", txt))
+    pipe = len(re.findall(r"BrokenPipe", txt))
+    tam = sorted(int(m) for m in re.findall(r"request (\d+) bytes", txt))
+    med = tam[len(tam) // 2] if tam else 0
+    res = {"linhas": len(linhas), "400": n400, "429": n429, "502": n502, "503": n503,
+           "connection_reset": reset, "broken_pipe": pipe,
+           "request_mediano_bytes": med, "request_min_bytes": tam[0] if tam else 0,
+           "request_max_bytes": tam[-1] if tam else 0}
+    if a.json:
+        print(json.dumps(res, ensure_ascii=False))
+        return 0
+    print("gate do celular (log com %d linhas — so avisos, sem linha de sucesso):" % len(linhas))
+    print("  400 (body malformado): %d | 429 (teto de contexto/cota): %d | 502: %d | 503: %d" % (n400, n429, n502, n503))
+    print("  ConnectionReset: %d | BrokenPipe: %d" % (reset, pipe))
+    if tam:
+        print("  tamanho do request: min %d B | mediana %d B (%.2f MB) | max %d B (%.2f MB)"
+              % (tam[0], med, med / 1e6, tam[-1], tam[-1] / 1e6))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

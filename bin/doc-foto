@@ -1,0 +1,333 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""doc-foto - fotografa um documento, le o texto (OCR offline) e guarda pesquisavel.
+
+POR QUE EXISTE: papel nao entra em busca. Aqui o celular e' o scanner: foto ->
+texto -> indice local. Depois e' so perguntar ("o boleto de outubro", "o laudo
+da pericia") e o texto sai do indice, sem abrir app nenhum.
+
+    doc-foto                        # camera traseira (id 0) -> OCR -> indexa
+    doc-foto --camera 1             # frontal
+    doc-foto --arquivo foto.jpg     # indexa uma imagem que ja existe
+    doc-foto --busca "pericia"      # procura no texto de TUDO que ja foi lido
+    doc-foto --ultimo               # ultimo documento (previa)
+    doc-foto --ultimo --texto       # texto completo do ultimo
+    doc-foto --lista 10             # os 10 ultimos (arquivo, data, tamanho)
+    doc-foto --json ...             # saida em JSON
+
+ONDE FICA: ~/docs/scan/<data>.jpg  +  ~/docs/scan/indice.jsonl
+PRIVACIDADE: tudo LOCAL. Texto de documento nunca vai pro bus/repo/Telegram —
+so nome de arquivo e data, se algum dia publicar. O OCR roda no proprio celular
+(tesseract 5.5 + portugues), sem depender do host nem de internet.
+
+LIMITE CONHECIDO: foto torta/escura/sem foco le pior. O pre-processamento
+(deskew por EXIF, cinza, autocontraste, 2200 px) ajuda, mas foto reta > foto bonita.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unicodedata
+
+HOME = os.path.expanduser("~")
+SCAN = os.path.join(HOME, "docs/scan")
+INDEX = os.path.join(SCAN, "indice.jsonl")
+IDIOMAS = "por+eng"
+MAX_LADO = 2200          # px: acima disso o OCR fica lento sem ganhar precisao
+
+PIL_OK = True
+try:
+    from PIL import Image, ImageOps
+except Exception:        # noqa: BLE001
+    PIL_OK = False
+
+
+# ---------------------------------------------------------------- utilidades
+def rodar(cmd, timeout=180):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except Exception as e:  # noqa: BLE001
+        return 1, "", str(e)
+
+
+def norm(t):
+    """minusculas sem acento — o OCR troca acento com frequencia."""
+    t = unicodedata.normalize("NFKD", t or "")
+    return "".join(c for c in t if not unicodedata.combining(c)).lower()
+
+
+def carimbo():
+    return dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+
+
+def avisar(msg, titulo="doc-foto"):
+    rodar(["termux-toast", "-g", "middle", msg[:110]], timeout=10)
+
+
+def tem_tesseract():
+    return bool(rodar(["sh", "-c", "command -v tesseract"], timeout=15)[1].strip())
+
+
+def langs():
+    rc, out, _ = rodar(["tesseract", "--list-langs"], timeout=30)
+    return set(out.split()) if rc == 0 else set()
+
+
+# ------------------------------------------------------------------ imagem
+def preparar(origem, destino):
+    """endireita (EXIF), reduz, cinza e ganha contraste; devolve caminho tratado."""
+    if not PIL_OK:
+        return origem
+    try:
+        im = Image.open(origem)
+        im = ImageOps.exif_transpose(im)      # foto de celular vem girada no EXIF
+        if im.mode not in ("L", "RGB"):
+            im = im.convert("RGB")
+        w, h = im.size
+        escala = min(1.0, float(MAX_LADO) / max(w, h))
+        if escala < 1.0:
+            im = im.resize((max(1, int(w * escala)), max(1, int(h * escala))),
+                           Image.LANCZOS)
+        im = im.convert("L")
+        im = ImageOps.autocontrast(im, cutoff=1)
+        im.save(destino)
+        return destino
+    except Exception:  # noqa: BLE001
+        return origem
+
+
+def ocr(caminho):
+    idioma = IDIOMAS if {"por", "eng"} <= langs() else "eng"
+    with tempfile.TemporaryDirectory(dir=os.path.join(HOME, ".cache") if os.path.isdir(
+            os.path.join(HOME, ".cache")) else None) as tmp:
+        tratado = os.path.join(tmp, "doc.png")
+        img = preparar(caminho, tratado)
+        rc, out, err = rodar(["tesseract", img, "stdout", "-l", idioma,
+                              "--psm", "3"], timeout=240)
+    if rc != 0:
+        return None, (err or "tesseract falhou").strip().splitlines()[-1][:160], idioma
+    texto = re.sub(r"[ \t]+\n", "\n", out)
+    texto = re.sub(r"\n{3,}", "\n\n", texto).strip()
+    return texto, None, idioma
+
+
+# ------------------------------------------------------------------- indice
+def indexar(caminho, origem="foto"):
+    os.makedirs(SCAN, exist_ok=True)
+    if not os.path.isfile(caminho):
+        return {"erro": "arquivo nao existe: %s" % caminho}
+    if not tem_tesseract():
+        return {"erro": "tesseract nao instalado (pkg install tesseract)"}
+
+    texto, erro, idioma = ocr(caminho)
+    if erro:
+        return {"erro": "OCR: %s" % erro}
+
+    linhas = [l for l in texto.splitlines() if l.strip()]
+    if len(texto) < 10:
+        # nao indexa lixo: uma foto escura/sem papel nao pode poluir a busca
+        return {"erro": "texto insuficiente (%d caracteres) — foto escura, torta ou "
+                        "sem documento? arquivo mantido em %s"
+                        % (len(texto), caminho), "vazio": True}
+
+    reg = {
+        "arquivo": os.path.abspath(caminho),
+        "ts": dt.datetime.now().replace(microsecond=0).isoformat(),
+        "epoch": int(dt.datetime.now().timestamp()),
+        "chars": len(texto),
+        "linhas": len(linhas),
+        "idioma": idioma,
+        "origem": origem,
+        "texto": texto,
+    }
+    with open(INDEX, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(reg, ensure_ascii=False) + "\n")
+    return reg
+
+
+def ler_indice():
+    if not os.path.isfile(INDEX):
+        return []
+    out = []
+    with open(INDEX, encoding="utf-8") as fh:
+        for linha in fh:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                out.append(json.loads(linha))
+            except Exception:  # noqa: BLE001
+                continue
+    return out
+
+
+def snippet(texto, termo=None, largura=76, contexto=1):
+    linhas = texto.splitlines()
+    if not termo:
+        return "\n".join(linhas[:6])
+    alvo = norm(termo)
+    for i, l in enumerate(linhas):
+        if alvo in norm(l):
+            ini, fim = max(0, i - contexto), min(len(linhas), i + contexto + 1)
+            bloco = []
+            for j in range(ini, fim):
+                marca = ">>" if j == i else "  "
+                bloco.append("%s %s" % (marca, linhas[j].strip()[:largura]))
+            return "\n".join(bloco)
+    return ""
+
+
+# -------------------------------------------------------------------- acoes
+def acao_foto(args):
+    alvo = args.arquivo
+    if not alvo:
+        os.makedirs(SCAN, exist_ok=True)
+        alvo = os.path.join(SCAN, carimbo() + ".jpg")
+        tmp = alvo + ".part"
+        rc, _, err = rodar(["termux-camera-photo", "-c", str(args.camera), tmp],
+                           timeout=120)
+        if rc != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) < 1024:
+            msg = (err or "").strip().splitlines()[-1][:140] if err else "sem arquivo"
+            print("camera falhou: %s" % msg, file=sys.stderr)
+            print("-> se for permissao: Ajustes > Apps > Termux:API > Permissoes > "
+                  "Camera", file=sys.stderr)
+            return 2
+        os.replace(tmp, alvo)
+
+    reg = indexar(alvo, origem="camera" if not args.arquivo else "arquivo")
+    if "erro" in reg:
+        if reg.get("vazio") and not args.arquivo:
+            # captura inutil (tampa da camera, escuro): nao deixa lixo em ~/docs/scan
+            try:
+                os.remove(alvo)
+            except OSError:
+                pass
+            print("nada legivel na foto — descartada. Tente de novo com mais luz.",
+                  file=sys.stderr)
+            return 1
+        print(reg["erro"], file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps({k: v for k, v in reg.items() if k != "texto"},
+                         ensure_ascii=False))
+        return 0
+
+    print("indexado: %s" % reg["arquivo"])
+    print("          %d caracteres, %d linhas, idioma %s"
+          % (reg["chars"], reg["linhas"], reg["idioma"]))
+    if reg["chars"] < 25:
+        print("          ATENCAO: pouco texto — foto escura/torta/fora de foco?")
+    print()
+    print(snippet(reg["texto"]))
+    avisar("Documento lido: %d caracteres" % reg["chars"])
+    return 0
+
+
+def acao_busca(args):
+    docs = ler_indice()
+    if not docs:
+        print("indice vazio — rode `doc-foto` para fotografar um documento")
+        return 1
+    alvo = norm(args.busca)
+    achados = [d for d in docs if alvo in norm(d.get("texto", ""))]
+    if args.json:
+        print(json.dumps([{"arquivo": d["arquivo"], "ts": d["ts"],
+                           "trecho": snippet(d["texto"], args.busca)} for d in achados],
+                         ensure_ascii=False, indent=1))
+        return 0 if achados else 1
+    print("%d documento(s) com \"%s\" (de %d lidos):\n"
+          % (len(achados), args.busca, len(docs)))
+    for d in sorted(achados, key=lambda x: -x.get("epoch", 0))[:args.limite]:
+        print("  %s  (%s, %d ch)\n%s\n"
+              % (os.path.basename(d["arquivo"]), d["ts"][:16], d.get("chars", 0),
+                 snippet(d["texto"], args.busca, contexto=args.contexto)))
+    return 0 if achados else 1
+
+
+def acao_lista(args):
+    docs = sorted(ler_indice(), key=lambda d: -d.get("epoch", 0))
+    limite = args.limite or 10
+    if not docs:
+        print("nenhum documento lido ainda.")
+        return 0
+    if args.json:
+        print(json.dumps([{k: v for k, v in d.items() if k != "texto"}
+                          for d in docs[:limite]], ensure_ascii=False, indent=1))
+        return 0
+    print("%-40s %-17s %7s %6s" % ("arquivo", "quando", "chars", "linhas"))
+    for d in docs[:limite]:
+        print("%-40s %-17s %7d %6d"
+              % (os.path.basename(d["arquivo"]), d["ts"][:16].replace("T", " "),
+                 d.get("chars", 0), d.get("linhas", 0)))
+    print("\ntotal: %d documento(s)" % len(docs))
+    return 0
+
+
+def acao_ultimo(args):
+    docs = sorted(ler_indice(), key=lambda d: -d.get("epoch", 0))
+    if not docs:
+        print("nenhum documento lido ainda.")
+        return 1
+    d = docs[0]
+    if args.json:
+        print(json.dumps(d, ensure_ascii=False, indent=1))
+        return 0
+    print("%s  (%s)" % (d["arquivo"], d["ts"][:16]))
+    print("-" * 60)
+    print(d["texto"] if args.texto else snippet(d["texto"], None, contexto=0)[:1500])
+    if not args.texto:
+        print("...\n(--texto para o texto completo)")
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(
+        prog="doc-foto",
+        description="fotografa documento, le o texto (OCR offline) e deixa pesquisavel",
+        epilog='ex.: doc-foto   |   doc-foto --busca "boleto"')
+    ap.add_argument("--camera", default="0", help="id da camera (0=traseira)")
+    ap.add_argument("--arquivo", help="indexa uma imagem existente em vez de fotografar")
+    ap.add_argument("--busca", help="procura um termo no texto dos documentos")
+    ap.add_argument("--contexto", type=int, default=1, help="linhas em volta do achado")
+    ap.add_argument("--ultimo", action="store_true", help="mostra o ultimo documento")
+    ap.add_argument("--texto", action="store_true", help="com --ultimo: texto completo")
+    ap.add_argument("--lista", nargs="?", type=int, const=0, default=None,
+                    metavar="N", help="lista os N ultimos documentos lidos")
+    ap.add_argument("--limite", type=int, default=10)
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+
+    if a.lista is not None and not a.limite:
+        a.limite = 10
+    if a.lista is not None and isinstance(a.lista, int) and a.lista > 0:
+        a.limite = a.lista
+
+    if a.busca is not None and not a.busca.strip():
+        print("--busca precisa de um termo", file=sys.stderr)
+        return 2
+
+    if not tem_tesseract() and not a.lista and not a.busca and not a.ultimo:
+        print("falta o OCR: pkg install tesseract", file=sys.stderr)
+        return 2
+
+    if a.busca:
+        return acao_busca(a)
+    if a.lista is not None:
+        return acao_lista(a)
+    if a.ultimo:
+        return acao_ultimo(a)
+    return acao_foto(a)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

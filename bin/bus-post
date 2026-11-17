@@ -1,0 +1,165 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""bus-post - publica no barramento de coordenacao (issue #12 do Kuchiriel/mt5)
+DIRETO pelo GitHub API, sem depender do coord-mcp do Linux.
+
+Por que: o `coord-cli` (MCP) depende que o coord-mcp do Linux (8765) este de pe.
+Se o Linux cair (RAM/load/MTP), a frota perde a voz — inclusive o heartbeat, que
+existe justamente para acordar gente. Este cliente so depende do `gh` (autenticado)
+e do repo privado, entao o CELULAR continua acordando agentes mesmo com o Linux fora.
+
+    bus-post "texto"                     # status (kind=status)
+    bus-post "texto" --to Onca --kind msg
+    BUS_LANE=termux/vpnsec bus-post "texto" --claim "repo ai-mesh"
+    bus-post --read 5                    # ultimos N comentarios do bus
+    bus-post --who                       # quem postou por ultimo
+    # env: BUS_GH_TIMEOUT=90, BUS_GH_READ_RETRIES=3, BUS_GH_RETRY_DELAY=0.5
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+REPO = os.environ.get("BUS_REPO", "Kuchiriel/mt5")
+ISSUE = os.environ.get("BUS_ISSUE", "12")
+AGENT = os.environ.get("BUS_AGENT", "crouton-alpha")
+LANE = os.environ.get("BUS_LANE", "termux/vpnsec")
+GH_TIMEOUT = int(os.environ.get("BUS_GH_TIMEOUT", "90"))
+GH_READ_RETRIES = int(os.environ.get("BUS_GH_READ_RETRIES", "3"))
+GH_RETRY_DELAY = float(os.environ.get("BUS_GH_RETRY_DELAY", "0.5"))
+
+
+def gh(*args, input_text=None):
+    cmd = ["gh", "api"] + list(args)
+    if input_text is not None:
+        # gh -F body=@- nao funciona com stdin de subprocess (fecha antes): usa arquivo
+        tmp = os.path.join(os.environ.get("PREFIX", "/data/data/com.termux/files/usr"),
+                           "tmp/opencode", "bus-post-body.md")
+        os.makedirs(os.path.dirname(tmp), exist_ok=True)
+        with open(tmp, "w") as f:
+            f.write(input_text)
+        cmd += ["-F", "body=@" + tmp]
+
+    # MEDIDO 16/11: o GitHub API devolveu 'unexpected EOF' de forma transitoria.
+    # A leitura do bus falhou, mas read_bodies engolia o erro e imprimia uma
+    # pagina antiga como se fosse a atual. LEITURAS sao seguras para repetir;
+    # POST nao e' repetido porque a resposta pode ter sido perdida DEPOIS do
+    # comentario ter sido aceito (duplicaria a mensagem).
+    is_read = input_text is None
+    attempts = max(1, GH_READ_RETRIES) if is_read else 1
+    last_error = ""
+    for attempt in range(attempts):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=GH_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            last_error = f"timeout apos {GH_TIMEOUT}s"
+        else:
+            if r.returncode == 0:
+                return r.stdout
+            last_error = (r.stderr or r.stdout).strip()[:300]
+        if attempt + 1 < attempts:
+            time.sleep(GH_RETRY_DELAY * (attempt + 1))
+    raise RuntimeError(last_error or "falha desconhecida do gh")
+
+
+def last_page():
+    n = int(json.loads(gh(f"repos/{REPO}/issues/{ISSUE}", "-q", ".comments")))
+    return max((n - 1) // 100 + 1, 1), n
+
+
+def read_bodies(n_pages=3):
+    page, total = last_page()
+    out = []
+    errors = []
+    for p in range(max(page - n_pages + 1, 1), page + 1):
+        try:
+            out.append(gh(f"repos/{REPO}/issues/{ISSUE}/comments?per_page=100&page={p}",
+                          "-q", ".[].body"))
+        except Exception as e:
+            errors.append(f"pagina {p}: {e}")
+    # NUNCA devolver uma janela parcial silenciosa: um '--who' antigo parece um
+    # bus parado e induz o agente a repetir trabalho ja entregue.
+    if errors:
+        raise RuntimeError("leitura incompleta do bus (" + "; ".join(errors) + ")")
+    return "\n--- END ---\n".join(out), total
+
+
+def parse(bodies):
+    """Todos os blocos coord-json do corpo (varios por pagina: 100 por vez)."""
+    msgs = []
+    for m in re.finditer(r"```coord-json\s*(\{.*?\})\s*```", bodies, re.S):
+        try:
+            d = json.loads(m.group(1))
+        except Exception:
+            continue
+        msgs.append(d)
+    return msgs
+
+
+def post(note, to="", kind="status", claim="", extra=None):
+    payload = {
+        "kind": kind,
+        "agent": AGENT,
+        "to": to or "",
+        "lane": LANE,
+        "files": [],
+        "intent": (claim or note)[:180],
+        "note": note,
+        "pr": None,
+        "head": "",
+        "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if extra:
+        payload.update(extra)
+    body = ("**%s** de `%s` na lane `%s`\n\n```coord-json\n%s\n```"
+            % (kind, AGENT, LANE, json.dumps(payload, indent=2, ensure_ascii=False)))
+    url = gh(f"repos/{REPO}/issues/{ISSUE}/comments", input_text=body).strip()
+    return url
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("text", nargs="?")
+    ap.add_argument("--to", default="")
+    ap.add_argument("--kind", default="status")
+    ap.add_argument("--claim", default="")
+    ap.add_argument("--read", type=int, default=0)
+    ap.add_argument("--who", action="store_true")
+    ap.add_argument("--last", type=int, default=5)
+    a = ap.parse_args()
+
+    if a.read or a.who:
+        try:
+            bodies, total = read_bodies()
+        except Exception as e:
+            print("ERRO ao ler o bus (sem estado parcial):", e, file=sys.stderr)
+            return 1
+        msgs = parse(bodies)
+        if a.who:
+            for m in msgs[-a.last:]:
+                note = (m.get("note") or m.get("intent") or "")[:200].replace("\n", " ")
+                print("%s | %-18s -> %-14s | %s" % (m.get("ts", "?"), m.get("agent", "?"),
+                                                    m.get("to") or "-", note))
+        else:
+            for m in msgs[-a.read:]:
+                print(json.dumps(m, ensure_ascii=False, indent=1)[:1500])
+                print("---")
+        return 0
+
+    if not a.text:
+        ap.print_help()
+        return 2
+    try:
+        url = post(a.text, a.to, a.kind, a.claim)
+    except Exception as e:
+        print("ERRO ao publicar no bus:", e, file=sys.stderr)
+        return 1
+    print("bus: publicado", url)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

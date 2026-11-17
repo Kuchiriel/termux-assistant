@@ -1,0 +1,568 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""fleet-doctor — saude da FROTA em 1 comando (1 linha).
+
+Reune o estado de todos os devices e do bus:
+  - CELULAR  : RAM/swap/disco/bateria/jobs/sshd/plugin/auto-wake/fila
+  - HOST     : (SSH na tailnet) RAM disponivel/swap/carga/sessoes opencode/RAG
+  - BUS      : ultima mensagem de cada agente + quantos estao vivos
+  - FILA     : pendencias do kanban + propostas phone-fs
+
+    fleet-doctor            # 1 linha (resumo)
+    fleet-doctor --json     # estruturado
+    fleet-doctor --full     # blocos detalhados
+    fleet-doctor --publish  # publica no bus (rota direta, sem depender do coord-mcp)
+
+NAO reinicia nada, NAO apaga nada. Leitura pura (+ 1 POST opcional no bus).
+"""
+import argparse
+import concurrent.futures
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+HOST_IP = os.environ.get("HOST_IP", "${TA_LINUX_IP4:-100.121.100.103}")
+HOST_LAN_IP = os.environ.get("HOST_LAN_IP", "${TA_LINUX_LAN:-192.168.15.10}")
+HOST_USER = os.environ.get("HOST_USER", "nixos")
+BUS_REPO = "Kuchiriel/mt5"
+BUS_ISSUE = 12
+ALIVE_MIN = 30          # mensagem no bus nos ultimos N min => agente "vivo"
+STATE = os.path.join(HOME, ".local/state")
+
+
+def run(cmd, timeout=45, input_text=None):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input_text)
+        return r.stdout if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def sh(cmd, timeout=45):
+    return run(["bash", "-lc", cmd], timeout)
+
+
+# ---------------- CELULAR ----------------
+def saude_celular():
+    out = {}
+    free = sh("free -m | awk 'NR==2{print $2,$3,$7} NR==3{print $3}'", 20).split()
+    try:
+        out["ram_total_mb"] = int(free[0])
+        out["ram_usada_mb"] = int(free[1])
+        out["ram_disponivel_mb"] = int(free[2])
+        out["swap_usada_mb"] = int(free[3]) if len(free) > 3 else 0
+    except Exception:
+        out["ram_total_mb"] = out["ram_disponivel_mb"] = out["swap_usada_mb"] = 0
+    df = sh("df -k %s | tail -1 | awk '{print $4,$5,$2}'" % HOME, 20).split()
+    try:
+        out["disco_livre_kb"] = int(df[0])
+        out["disco_pct_usado"] = int(df[1].rstrip("%"))
+        out["disco_total_kb"] = int(df[2])
+    except Exception:
+        out["disco_livre_kb"] = 0
+    out["hd_livre_kb"] = 0
+    dfh = sh("df -k /storage/6E7C-8AB3 2>/dev/null | tail -1 | awk '{print $4}'", 20).split()
+    if dfh:
+        try:
+            out["hd_livre_kb"] = int(dfh[0])
+        except Exception:
+            pass
+    bat = sh("%s/bin/battery-monitor status 2>/dev/null" % HOME, 40)
+    for chave, rotulo in (("nivel", "nivel"), ("bateria_saude", "saude"),
+                          ("bateria_temp_c", "temperatura"), ("carregando", "carregando")):
+        m = re.search(rf"^\s*{rotulo}\s*:\s*(.+)$", bat, re.I | re.M)
+        if m:
+            v = m.group(1).strip()
+            if chave == "bateria_temp_c":
+                num = re.sub(r"[^0-9.,-]", "", v).replace(",", ".")
+                try:
+                    v = float(num)
+                except Exception:
+                    v = num
+            elif chave == "nivel":
+                v = re.sub(r"[^0-9]", "", v)
+            out[chave] = v
+    out["jobs"] = int(sh("termux-job-scheduler --pending 2>/dev/null | grep -c 'Pending Job'", 30).strip() or 0)
+    tl = sh("ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,\"/\");print a[1]}' | grep -E '^100\\.' | head -1", 20).strip()
+    out["tailnet_ip"] = tl
+    out["sshd_8022"] = "ABERTA" if tl and sh(
+        "timeout 5 bash -c 'cat < /dev/null > /dev/tcp/%s/8022' 2>/dev/null && echo sim" % tl, 12).strip() else "FECHADA"
+    out["coord_mcp_direto"] = "UP" if sh(
+        "timeout 5 bash -c 'cat < /dev/null > /dev/tcp/${TA_LINUX_IP4:-100.121.100.103}/8765' 2>/dev/null && echo sim", 12).strip() else "DOWN"
+    out["coord_mcp"] = out["coord_mcp_direto"]
+    # MEDIDO 09/11: sem isto, a linha de saude dizia so 'coord-mcp DOWN' e nao
+    # distinguia 'o HOST caiu' de 'o CELULAR esta sem tailnet' (outra VPN tomou
+    # o slot do Android). Sao acoes OPOSTAS, e quem le a saude da frota precisa
+    # saber QUAL delas aplicar.
+    if not tl:
+        tun = sh("ip -4 -o addr show 2>/dev/null | awk '$2 ~ /^tun/ {split($4,a,\"/\");print a[1]}' | head -1", 20).strip()
+        out["celular_sem_tailnet"] = True
+        out["outra_vpn"] = tun or "?"
+        out["causa_coord_down"] = ("CELULAR SEM TAILNET (outra VPN no slot do Android, tun=%s) -> a acao e' no celular; o coord-mcp volta sozinho" % (tun or "?"))
+    else:
+        out["celular_sem_tailnet"] = False
+        out["causa_coord_down"] = (("celular TEM tailnet (%s) -> se o coord-mcp nao responde, a causa e' no host" % tl)
+                                   if out["coord_mcp"] != "UP" else "")
+    marcadores = {}
+    for m in ("module", "setup", "hook-context", "auto-wake-hook", "mcp-trim", "catalog"):
+        p = os.path.join(STATE, "memory-termux-%s.txt" % m)
+        marcadores[m] = os.path.isfile(p)
+    out["plugin_marcadores"] = marcadores
+    out["plugin_ok"] = all(marcadores.values())
+    aw = sh("%s/bin/auto-wake status 2>/dev/null | head -1" % HOME, 30)
+    m = re.search(r"fila=(\d+).*wakes nesta hora=(\d+)/(\d+)", aw)
+    out["auto_wake"] = {"fila": int(m.group(1)) if m else 0,
+                         "wakes_hora": int(m.group(2)) if m else 0,
+                         "teto": int(m.group(3)) if m else 0}
+    pl = sh("%s/bin/phone-fs plans 2>/dev/null | grep -c 'proposto'" % HOME, 40).strip()
+    out["propostas_pendentes"] = int(pl or 0)
+    return out
+
+
+# ---------------- HOST (SSH tailnet) ----------------
+PROBE = r"""
+echo "MEMAVAIL=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)"
+echo "RAM_USADA=$(free -m | awk 'NR==2{print $3}')"
+echo "RAM_TOTAL=$(free -m | awk 'NR==2{print $2}')"
+echo "SWAP_USADA=$(free -m | awk 'NR==3{print $3}')"
+echo "SWAP_TOTAL=$(free -m | awk 'NR==3{print $2}')"
+echo "LOAD=$(cut -d' ' -f1-3 /proc/loadavg)"
+echo "SESSOES=$(pgrep -fc opencode 2>/dev/null || echo 0)"
+echo "DISK_FREE=$(df -Pk /home | awk 'NR==2{print int($4/1024/1024)}')"
+"""
+
+
+def saude_host():
+    out = {}
+    # MEDIDO 10/11: as DUAS sondas do host (SSH + coord-cli health) eram SEQUENCIAIS
+    # e o coord-cli health passa pelo /mcp do coord-mcp, que ficou pendurado no host
+    # -> esta funcao sozinha segurava o painel por ~60 s. Agora sao PARALELAS e o
+    # coord-cli health tem teto de 25 s (o RAG tambem vem pela sonda SSH, via
+    # QDRANT/EMB).
+    def ssh_probe(ip):
+        return run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                    "%s@%s" % (HOST_USER, ip), "bash -s"], timeout=45, input_text=PROBE)
+
+    def coord_health():
+        return sh("%s/bin/coord-cli health 2>/dev/null" % HOME, 25)
+
+    # Tailnet e LAN sao testadas EM PARALELO: quando celular->PC pela tailnet
+    # esta quebrada, a LAN ainda prova que a maquina esta viva e devolve RAM/carga.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        f_tail = ex.submit(ssh_probe, HOST_IP)
+        f_lan = ex.submit(ssh_probe, HOST_LAN_IP)
+        f_hj = ex.submit(coord_health)
+        raw_tail = f_tail.result()
+        raw_lan = f_lan.result()
+        hj = f_hj.result()
+
+    raw = raw_tail or raw_lan
+    rota = "tailnet" if raw_tail else ("LAN" if raw_lan else "sem-rota")
+    out["rota"] = rota
+    if not raw.strip():
+        return {"status": "INDISPONIVEL", "rota": rota}
+    for k in ("MEMAVAIL", "RAM_USADA", "RAM_TOTAL", "SWAP_USADA", "SWAP_TOTAL",
+              "LOAD", "SESSOES", "DISK_FREE", "QDRANT", "EMB"):
+        m = re.search(rf"^{k}=(\S+)", raw, re.M)
+        if not m:
+            continue
+        v = m.group(1)
+        out[k.lower()] = int(v) if v.isdigit() else v
+    # RAG: perguntar ao coord_health (o RAG roda em container; curl no localhost do host
+    # da Connection refused e gerava 'RAG FORA' falso)
+    out["rag_ok"] = None
+    if hj.strip():
+        try:
+            hd = json.loads(hj)
+            out["rag_ok"] = bool(hd.get("rag_ok"))
+            out["servicos_rag"] = {k: hd.get(k) for k in
+                                    ("router_8080", "mtp_8092", "qdrant_6333", "embeddings_8081", "reranker_8082")}
+            ram = hd.get("ram") or {}
+            out["ram_coord_health"] = ram
+        except Exception:
+            pass
+    rag = out.get("rag_ok")
+    disp = out.get("memavail", 0)
+    load1 = float(str(out.get("load", "0")).split()[0] or 0)
+    swapu, swapt = out.get("swap_usada", 0), out.get("swap_total", 0)
+    swap_pct = int(swapu * 100 / swapt) if swapt else 0
+    if disp < 1200 and load1 >= 4:
+        out["status"] = "CRITICO"
+    elif disp < 1200:
+        out["status"] = "CRITICO"
+    elif disp < 3000:
+        out["status"] = "ATENCAO"
+    elif swap_pct >= 80 and disp < 6000:
+        out["status"] = "ATENCAO"
+    else:
+        out["status"] = "OK"
+    out["swap_pct"] = swap_pct
+    return out
+
+
+def roster_host():
+    """Roster do host (SSH tailnet ou LAN): mapeia agente -> sessao e detecta sessao compartilhada/velha."""
+    out = {"agentes": {}, "sessoes_compartilhadas": [], "sessoes_obsoletas": [], "erro": None}
+
+    def fetch_roster(ip):
+        return run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                    "%s@%s" % (HOST_USER, ip),
+                    "cat ~/projects/.agents/roster.json 2>/dev/null"], timeout=45)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f_tail = ex.submit(fetch_roster, HOST_IP)
+        f_lan = ex.submit(fetch_roster, HOST_LAN_IP)
+        raw_tail = f_tail.result()
+        raw_lan = f_lan.result()
+    raw = raw_tail or raw_lan
+    out["rota"] = "tailnet" if raw_tail else ("LAN" if raw_lan else "sem-rota")
+    if not raw.strip():
+        out["erro"] = "nao consegui ler o roster"
+        return out
+    try:
+        d = json.loads(raw)
+    except Exception:
+        out["erro"] = "roster ilegivel"
+        return out
+    itens = d if isinstance(d, list) else (d.get("agents") or d.get("roster") or [])
+    por_sessao = {}
+    for it in itens:
+        if not isinstance(it, dict):
+            continue
+        nome = it.get("name") or it.get("codinome") or "?"
+        sess = it.get("session") or it.get("sessionID") or ""
+        out["agentes"][nome] = sess
+        if sess:
+            por_sessao.setdefault(sess, []).append(nome)
+    for sess, nomes in por_sessao.items():
+        if len(nomes) > 1:
+            out["sessoes_compartilhadas"].append({"sessao": sess, "agentes": nomes})
+    # idade das sessoes (1 chamada a API do host, tailnet+LAN em paralelo)
+    def fetch_sessoes(ip):
+        return run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                    "%s@%s" % (HOST_USER, ip),
+                    "opencode api GET /api/session 2>/dev/null"], timeout=60)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f_tail = ex.submit(fetch_sessoes, HOST_IP)
+        f_lan = ex.submit(fetch_sessoes, HOST_LAN_IP)
+        sessoes_tail = f_tail.result()
+        sessoes_lan = f_lan.result()
+    sessoes = sessoes_tail or sessoes_lan
+    try:
+        sd = json.loads(sessoes)
+        itens = sd.get("data", sd)
+        agora = datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000
+        for it in (itens if isinstance(itens, list) else []):
+            sid = it.get("id")
+            if sid not in por_sessao:
+                continue
+            upd = ((it.get("time") or {}).get("updated") or 0)
+            if upd:
+                min_ = int((agora - upd) / 60000)
+                if min_ > 120:
+                    out["sessoes_obsoletas"].append({"sessao": sid, "min": min_,
+                                                     "agentes": por_sessao[sid]})
+    except Exception:
+        pass
+    out["total_agentes"] = len(out["agentes"])
+    return out
+
+
+def atividade_sessoes():
+    """Ultima atividade (epoch) de cada agente, medida na sessao no host.
+
+    Por que: mensagem no bus mostra so quem POSTA; um agente pode estar trabalhando
+    na sessao e nao publicar no chat. A atividade da sessao e a metrica real.
+    """
+    out = {}
+
+    def fetch_roster(ip):
+        return run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                    "%s@%s" % (HOST_USER, ip),
+                    "cat ~/projects/.agents/roster.json 2>/dev/null"], timeout=45)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f_tail = ex.submit(fetch_roster, HOST_IP)
+        f_lan = ex.submit(fetch_roster, HOST_LAN_IP)
+        raw_tail = f_tail.result()
+        raw_lan = f_lan.result()
+    raw = raw_tail or raw_lan
+    if not raw.strip():
+        return out
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return out
+    itens = d if isinstance(d, list) else (d.get("agents") or d.get("roster") or [])
+    nomes = []
+    for it in itens:
+        if not isinstance(it, dict):
+            continue
+        nome = it.get("name") or it.get("codinome") or ""
+        if nome:
+            nomes.append(nome)
+    if not nomes:
+        return out
+
+    # MEDIDO 10/11: o 'wake-direct --last' por agente era SERIAL e cada um pode
+    # custar dezenas de segundos quando o host esta carregado — com 6 agentes o
+    # gasto era de minutos. Agora sao em paralelo (sao consultas de leitura).
+    def ultimo(nome):
+        return run(["bash", "-lc", "%s/bin/wake-direct --last '%s' 2>/dev/null | tail -1" % (HOME, nome)],
+                   timeout=70).strip()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(nomes)))) as ex:
+        vals = list(ex.map(ultimo, nomes))
+    for nome, last in zip(nomes, vals):
+        try:
+            out[nome] = int(last)
+        except Exception:
+            out[nome] = 0
+    return out
+
+
+# ---------------- BUS ----------------
+def saude_bus():
+    out = {"agentes": {}, "vivos": 0, "silenciosos": 0, "total": 0}
+    n = int(run(["gh", "api", f"repos/{BUS_REPO}/issues/{BUS_ISSUE}", "-q", ".comments"], 90).strip() or 0)
+    if not n:
+        return {"erro": "nao consegui ler o bus"}
+    last_page = max((n - 1) // 100 + 1, 1)
+    bodies = ""
+    for p in range(max(last_page - 2, 1), last_page + 1):
+        bodies += run(["gh", "api",
+                       f"repos/{BUS_REPO}/issues/{BUS_ISSUE}/comments?per_page=100&page={p}",
+                       "-q", ".[].body"], 90) + "\n--- END ---\n"
+    agora = datetime.datetime.now(datetime.timezone.utc)
+    ult = {}
+    for m in re.finditer(r"```coord-json\s*(\{.*?\})\s*```", bodies, re.S):
+        try:
+            d = json.loads(m.group(1))
+        except Exception:
+            continue
+        ag = d.get("agent")
+        ts = d.get("ts") or ""
+        if not ag or not ts:
+            continue
+        if ag not in ult or ts > ult[ag]["ts"]:
+            ult[ag] = {"ts": ts, "to": d.get("to") or "", "nota": (d.get("note") or d.get("intent") or "")[:120]}
+    out["total"] = len(ult)
+    for ag, v in ult.items():
+        try:
+            tsr = v["ts"].replace("Z", "")
+            if "." in tsr:
+                base, frac = tsr.split(".", 1)
+                tsr = base + "." + frac[:6].ljust(6, "0")
+            else:
+                tsr += ".000000"
+            dt = datetime.datetime.strptime(tsr, "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=datetime.timezone.utc)
+            min_ = int((agora - dt).total_seconds() // 60)
+        except Exception:
+            min_ = 9999
+        v["min_silencio"] = min_
+        v["vivo"] = min_ <= ALIVE_MIN
+        out["agentes"][ag] = v
+        out["vivos"] += 1 if v["vivo"] else 0
+        out["silenciosos"] += 0 if v["vivo"] else 1
+    return out
+
+
+# ---------------- FILA ----------------
+def saude_fila():
+    out = {}
+    board = os.path.join(HOME, "ai-mesh/queue/board.json")
+    if os.path.isfile(board):
+        try:
+            d = json.load(open(board))
+            itens = d.get("items", [])
+            out["total"] = len(itens)
+            out["por_status"] = {}
+            for i in itens:
+                out["por_status"][i.get("status", "?")] = out["por_status"].get(i.get("status", "?"), 0) + 1
+            out["pendentes"] = out["por_status"].get("backlog", 0) + out["por_status"].get("doing", 0)
+        except Exception as e:
+            out["erro"] = str(e)[:80]
+    else:
+        out["erro"] = "sem board"
+    return out
+
+
+def resumo1linha(c, h, b, f, ro=None, at=None, proc_cli=None):
+    ro = ro or {}
+    at = at or {}
+    alertas = []
+    if c["ram_disponivel_mb"] and c["ram_disponivel_mb"] < 800:
+        alertas.append("celular RAM %dMB" % c["ram_disponivel_mb"])
+    if c["disco_pct_usado"] and c["disco_pct_usado"] >= 90:
+        alertas.append("celular disco %d%%" % c["disco_pct_usado"])
+    if c["sshd_8022"] != "ABERTA":
+        alertas.append("celular sshd 8022 %s" % c["sshd_8022"])
+    if c["coord_mcp"] not in ("UP", "UP-LAN"):
+        alertas.append("coord-mcp %s" % c["coord_mcp"])
+        if c.get("causa_coord_down"):
+            alertas.append(c["causa_coord_down"])
+    if not c["plugin_ok"]:
+        alertas.append("plugin sem marcadores")
+    if c["propostas_pendentes"]:
+        alertas.append("%d proposta(s) p/ o dono" % c["propostas_pendentes"])
+    if h.get("status") in ("CRITICO", "ATENCAO"):
+        alertas.append("linux %s (disp %sMB, swap %s%%)" % (h["status"], h.get("memavail", "?"), h.get("swap_pct", "?")))
+    if h.get("status") == "INDISPONIVEL":
+        alertas.append("linux sem leitura")
+    try:
+        if float(str(h.get("load", "0")).split()[0]) >= 8:
+            alertas.append("linux carga %s" % str(h.get("load")).split()[0])
+    except Exception:
+        pass
+    if h.get("rag_ok") is False:
+        alertas.append("linux RAG fora")
+    if b.get("erro"):
+        alertas.append("bus ilegivel")
+    if ro.get("sessoes_compartilhadas"):
+        alertas.append("roster: %d sessao(oes) compartilhada(s) por varios agentes" % len(ro["sessoes_compartilhadas"]))
+    if ro.get("sessoes_obsoletas"):
+        alertas.append("roster: %d sessao(oes) obsoleta(s) (>2h)" % len(ro["sessoes_obsoletas"]))
+    # sessoes do roster SEM cliente anexado (medido 08/11): sem cliente nao ha watcher
+    # lendo o bus -> o wake publicado fica NAO CONSUMIDO (a mensagem espera).
+    # MEDIDO 10/11: a sonda (session-clients) foi INICIADA em paralelo no main()
+    # (o SSH do host carregado demora 22-60 s; em serie, ela segurava o relatorio
+    # do dono por ~2 min). Teto de 60 s; se estourar, o relatorio diz 'host lento'
+    # em vez de sumir.
+    sem_cli = []
+    h["clientes_status"] = "nao-medido"
+    out = ""
+    if proc_cli is not None:
+        try:
+            out, _ = proc_cli.communicate(timeout=70)
+            # MEDIDO 10/11: quando a sonda nao devolve a linha 'SEM CLIENTE', o
+            # resultado e' 'NAO MEDIDO' (host lento), e nao 'nenhum sem cliente'.
+            # Dizer 'nenhum' seria afirmar que medimos e nao achamos nada.
+            h["clientes_status"] = "ok" if "SEM CLIENTE" in out else "nao-medido"
+        except Exception:
+            try:
+                proc_cli.kill()
+            except Exception:
+                pass
+            h["clientes_status"] = "nao-medido"
+    for l in out.split("\n"):
+        if "SEM CLIENTE" in l:
+            sem_cli = [x.strip() for x in l.split(":", 1)[1].split(",") if x.strip() and x.strip() != "nenhum"]
+    h["sem_cliente"] = sem_cli
+    if h.get("clientes_status") != "ok":
+        h["sem_cliente_txt"] = "nao medido (host lento no SSH)"
+    else:
+        h["sem_cliente_txt"] = ",".join(sem_cli[:3]) if sem_cli else "nenhuma"
+    if h.get("clientes_status") != "ok":
+        alertas.append("sessao sem cliente: nao medido (host lento no SSH)")
+    if h.get("sem_cliente"):
+        alertas.append("sessao sem cliente: %s (wake no bus nao consumido)" % ",".join(h["sem_cliente"][:3]))
+    parados = [a for a, ep in (at or {}).items() if not ep or (datetime.datetime.now(datetime.timezone.utc).timestamp() - ep) > 3600]
+    if parados:
+        alertas.append("sessao parada >1h: %s" % ",".join(parados[:3]))
+    return (
+        "FROTA | celular: RAM {ram_disp}MB disp, swap {swap}MB, disco {disco}% usado ({disco_l}GB), "
+        "bat {bat}%, {temp}C, {jobs} jobs, sshd {sshd}, coord-mcp {cmcp}{cmcp_nota}, plugin {plug}, auto-wake {aw}/{aw_max} "
+        "| linux: {hstat}, RAM disp {hmem}MB, swap {hswap}%, carga {hload}, {hsess} sessoes, RAG {rag}, sem-cliente {hsc} "
+        "| bus: {vivos}/{total} vivos, {sil} silenciosos | sessoes: {nativos}/{nat} ativas | roster: {nag} agentes, {ncompart} sessao(oes) compartilhada(s) "
+        "| fila: {pend} pendentes "
+        "| alertas: {alertas}".format(
+            ram_disp=c["ram_disponivel_mb"], swap=c["swap_usada_mb"], disco=c["disco_pct_usado"],
+            disco_l=round(c["disco_livre_kb"] / 1048576, 1), bat=c.get("nivel", "?"),
+            temp=c.get("bateria_temp_c", "?"), jobs=c["jobs"], sshd=c["sshd_8022"], cmcp=c["coord_mcp"],
+            cmcp_nota=(" [CELULAR SEM TAILNET: %s]" % c.get("outra_vpn", "?")) if c.get("celular_sem_tailnet") else "",
+            plug="ok" if c["plugin_ok"] else "PARCIAL", aw=c["auto_wake"]["wakes_hora"], aw_max=c["auto_wake"]["teto"],
+            hstat=h.get("status", "?"), hmem=h.get("memavail", "?"), hswap=h.get("swap_pct", "?"),
+            hload=str(h.get("load", "?")).split()[0], hsess=h.get("sessoes", "?"),
+            hsc=h.get("sem_cliente_txt") or (",".join(h.get("sem_cliente") or []) or "nenhuma"),
+            rag=("ok" if h.get("rag_ok") else "FORA") if h.get("rag_ok") is not None else "?",
+            vivos=b.get("vivos", 0), total=b.get("total", 0), sil=b.get("silenciosos", 0),
+            nag=(ro.get("total_agentes") or 0), ncompart=len(ro.get("sessoes_compartilhadas") or []),
+            nat=len(at or {}),
+            nativos=sum(1 for v in (at or {}).values()
+                        if v and (datetime.datetime.now(datetime.timezone.utc).timestamp() - v) < 1800),
+            pend=f.get("pendentes", f.get("total", "?")), alertas=", ".join(alertas) or "nenhum",
+        )
+    )
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--full", action="store_true")
+    ap.add_argument("--publish", action="store_true")
+    a = ap.parse_args()
+
+    # MEDIDO 10/11: com o host carregado, o SSH do celular demora 22-60 s. As
+    # sondas que dependem do host (saude_host, roster_host, atividade_sessoes) eram
+    # SERIAIS e cada uma estourava 45 s de timeout: 161 s somados, e o RELATORIO DO
+    # DONO saia do tempo. Agora elas rodam EM PARALELO (são leituras), junto com a
+    # sonda de 'sessao sem cliente' (session-clients).
+    proc_cli = subprocess.Popen(["timeout", "60", os.path.join(HOME, "bin", "session-clients")],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        f_host = ex.submit(saude_host)
+        f_roster = ex.submit(roster_host)
+        f_at = ex.submit(atividade_sessoes)
+        f_bus = ex.submit(saude_bus)
+        h = f_host.result()
+        ro = f_roster.result()
+        at = f_at.result()
+        b = f_bus.result()
+    c = saude_celular()
+    if c.get("coord_mcp_direto") != "UP" and h.get("status") not in (None, "INDISPONIVEL"):
+        rota_h = h.get("rota") or "host"
+        if h.get("rag_ok") is True:
+            c["coord_mcp"] = "UP-LAN"
+            c["coord_mcp_fallback"] = "LAN"
+            c["causa_coord_down"] = ("rota DIRETA da tailnet esta inacessivel, mas o coord-mcp "
+                                     "respondeu via tunnel LAN (host medido via %s)" % rota_h)
+        else:
+            c["causa_coord_down"] = ("host VIVO (medido via %s), mas o coord-mcp nao respondeu "
+                                     "nem pelo fallback" % rota_h)
+    f = saude_fila()
+    linha = resumo1linha(c, h, b, f, ro, at, proc_cli)
+
+    if a.json:
+        print(json.dumps({"ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                          "resumo": linha, "celular": c, "host": h, "roster": ro, "atividade": at, "bus": b, "fila": f},
+                         ensure_ascii=False, indent=1))
+        return 0
+
+    print(linha)
+    if a.full:
+        print("\n-- CELULAR --")
+        for k, v in c.items():
+            print("  %-22s %s" % (k, v))
+        print("-- HOST --")
+        for k, v in h.items():
+            print("  %-22s %s" % (k, v))
+        print("-- BUS (ultimo de cada agente) --")
+        for ag, v in (b.get("agentes") or {}).items():
+            print("  %-22s ha %4smin  %s  %s" % (ag, v["min_silencio"], "VIVO" if v["vivo"] else "silencioso",
+                                                  v["nota"][:70].replace("\n", " ")))
+        print("-- ROSTER DO HOST (agente -> sessao) --")
+        for ag, sess in (ro.get("agentes") or {}).items():
+            print("  %-24s %s" % (ag, sess or "-"))
+        for x in ro.get("sessoes_compartilhadas") or []:
+            print("  !! COMPARTILHADA %s -> %s" % (x["sessao"][:20], ", ".join(x["agentes"])))
+        for x in ro.get("sessoes_obsoletas") or []:
+            print("  !! OBSOLETA %s (%dmin) -> %s" % (x["sessao"][:20], x["min"], ", ".join(x["agentes"])))
+        print("-- ATIVIDADE DAS SESSOES (metrica real de vida) --")
+        agora = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        for ag, ep in sorted((at or {}).items(), key=lambda kv: -(kv[1] or 0)):
+            print("  %-24s %s" % (ag, ("ha %dmin" % int((agora - ep) / 60)) if ep else "sem leitura"))
+        print("-- FILA --")
+        print("  ", json.dumps(f, ensure_ascii=False))
+
+    if a.publish:
+        r = subprocess.run([os.path.join(HOME, "bin/bus-post"), linha, "--kind", "status"],
+                           capture_output=True, text=True, timeout=150)
+        print("\nbus:", (r.stdout or r.stderr).strip()[:180])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

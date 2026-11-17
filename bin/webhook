@@ -1,0 +1,184 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""webhook - receptor de comandos remotos no Termux (para automacao de fora).
+
+Por que: e o "algo de fora que automatiza o celular" sem Tasker e sem root.
+Gatilhos possiveis:
+  - acao do app ntfy (POST no seu servidor);
+  - qualquer cliente HTTP na tailnet/LAN;
+  - o host NixOS chamando direto.
+
+Seguranca (falha fechada):
+  - so executa scripts que JA ESTAO em ~/hooks/ (allowlist por diretorio);
+  - exige token (X-Webhook-Token ou ?token=) — sem token, NADA executa;
+  - escuta so em 127.0.0.1 por padrao (use OC_WEBHOOK_HOST=100.x para a tailnet);
+  - timeout por execucao, limite de requisicoes por minuto, log de tudo;
+  - o stdout/stderr do script vai para o log e (opcionalmente) para o ntfy.
+
+Uso:
+    ~/bin/webhook init              # gera token e cria ~/hooks
+    ~/bin/webhook start [port]      # sobe (127.0.0.1:8789)
+    ~/bin/webhook test <hook>      # executa um hook localmente
+    ~/bin/webhook list              # hooks disponiveis
+"""
+
+import os, sys, time, hmac, json, secrets, subprocess, ipaddress
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections import defaultdict
+
+HOME = os.path.expanduser("~")
+HOOKS = os.path.join(HOME, "hooks")
+CONF = os.path.join(HOME, ".config", "webhook")
+TOKEN_FILE = os.path.join(CONF, "token")
+LOG = os.path.join(HOME, ".local", "state", "webhook.log")
+HOST = os.environ.get("OC_WEBHOOK_HOST", "127.0.0.1")
+PORT = int(os.environ.get("OC_WEBHOOK_PORT", "8789"))
+MAX_PER_MIN = int(os.environ.get("OC_WEBHOOK_RATE", "20"))
+HOOK_TIMEOUT = int(os.environ.get("OC_WEBHOOK_TIMEOUT", "120"))
+
+os.makedirs(CONF, exist_ok=True)
+os.makedirs(HOOKS, exist_ok=True)
+os.makedirs(os.path.dirname(LOG), exist_ok=True)
+
+
+def log(msg):
+    try:
+        with open(LOG, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
+def token():
+    try:
+        return open(TOKEN_FILE).read().strip()
+    except Exception:
+        return ""
+
+
+def ensure_token():
+    if not os.path.exists(TOKEN_FILE):
+        t = secrets.token_urlsafe(32)
+        os.makedirs(CONF, exist_ok=True)
+        open(TOKEN_FILE, "w").write(t)
+        os.chmod(TOKEN_FILE, 0o600)
+        print(f"token criado: {TOKEN_FILE}")
+        print(f"valor: {t}")
+    else:
+        print(f"token: {token()}")
+
+
+def hooks_list():
+    return sorted(f for f in os.listdir(HOOKS)
+                  if not f.startswith(".") and os.path.isfile(os.path.join(HOOKS, f)))
+
+
+def run_hook(name, payload=b"", env_extra=None):
+    """Executa um hook da allowlist. Devolve (rc, stdout+stderr)."""
+    if name not in hooks_list():
+        return 127, f"hook inexistente ou nao autorizado: {name}"
+    path = os.path.join(HOOKS, name)
+    if not os.access(path, os.X_OK):
+        try:
+            os.chmod(path, 0o700)
+        except Exception:
+            pass
+    env = os.environ.copy()
+    env["WEBHOOK_PAYLOAD"] = payload.decode("utf-8", "ignore")[:4000]
+    env["WEBHOOK_NAME"] = name
+    if env_extra:
+        env.update(env_extra)
+    try:
+        p = subprocess.run([path], capture_output=True, text=True, timeout=HOOK_TIMEOUT,
+                           env=env, cwd=HOME)
+        return p.returncode, ((p.stdout or "") + (p.stderr or ""))[:8000]
+    except subprocess.TimeoutExpired:
+        return 124, f"timeout apos {HOOK_TIMEOUT}s"
+    except Exception as e:
+        return 1, str(e)
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "termux-webhook/1.0"
+    hits = defaultdict(list)
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _reply(self, code, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _auth(self, query):
+        got = self.headers.get("X-Webhook-Token") or (query.get("token", [None])[0] if query else None)
+        return bool(got) and hmac.compare_digest(str(got), token())
+
+    def _rate_ok(self):
+        ip = self.client_address[0]
+        now = time.time()
+        h = [t for t in self.hits[ip] if now - t < 60]
+        if len(h) >= MAX_PER_MIN:
+            self.hits[ip] = h
+            return False
+        h.append(now)
+        self.hits[ip] = h
+        return True
+
+    def do_GET(self):
+        if self.path.split("?")[0] == "/health":
+            return self._reply(200, {"ok": True, "hooks": hooks_list()})
+        if self.path.split("?")[0] == "/list":
+            if not self._auth(dict(x.split("=", 1) for x in self.path.split("?")[1].split("&") if "=" in x) if "?" in self.path else {}):
+                return self._reply(401, {"error": "token required"})
+            return self._reply(200, {"hooks": hooks_list()})
+        return self._reply(404, {"error": "not found"})
+
+    def do_POST(self):
+        import urllib.parse
+        parts = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parts.query)
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n) if n else b""
+        if not self._auth(query):
+            log(f"REJECT auth de {self.client_address[0]} path={parts.path}")
+            return self._reply(401, {"error": "token required"})
+        if not self._rate_ok():
+            log(f"RATE_LIMIT de {self.client_address[0]}")
+            return self._reply(429, {"error": "rate limit"})
+        name = parts.path.rstrip("/").split("/")[-1]
+        rc, out = run_hook(name, body)
+        log(f"RUN {name} rc={rc} from={self.client_address[0]} out={out[:300]!r}")
+        return self._reply(200 if rc == 0 else 500,
+                           {"hook": name, "rc": rc, "output": out})
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "start"
+    if cmd == "init":
+        ensure_token()
+    elif cmd == "list":
+        for h in hooks_list():
+            print(" -", h)
+    elif cmd == "test":
+        name = sys.argv[2] if len(sys.argv) > 2 else ""
+        rc, out = run_hook(name, b"teste local")
+        print(f"rc={rc}\n{out}")
+        sys.exit(rc)
+    elif cmd == "start":
+        if not token():
+            ensure_token()
+            print(" rode de novo para subir")
+            sys.exit(1)
+        srv = ThreadingHTTPServer((HOST, PORT), Handler)
+        print(f"webhook em http://{HOST}:{PORT} (POST /hook/<nome> com X-Webhook-Token)", flush=True)
+        print(f"hooks: {', '.join(hooks_list()) or '(nenhum)'}", flush=True)
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
+    else:
+        print(__doc__)
+        sys.exit(2)

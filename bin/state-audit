@@ -1,0 +1,132 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""state-audit - acha estado ORFAO em ~/.local/state (arquivos que ninguem le).
+
+    state-audit            # tabela dos orfaos
+    state-audit --json     # saida em JSON
+    state-audit --help
+
+POR QUE (medido 13/11 no celular):
+    O 'bus-host.tsv' (486 linhas, ultimo registro de 11/11) e' o log de sinais de
+    vida do host Linux pelo bus. MEDIDO: NADA o le e NADA o escreve — o script
+    que o mantinha nao existe mais. E eu quase acreditei nele: li a ultima
+    entrada (11/11) e pensei 'o host nao posta no bus desde 11/11'; fui medir
+    no bus DIRETO e havia posts do host em 13/11. Um cache orfao mente em
+    silencio — e, pior, tem a aparencia de ser fonte (tem data, tem registro).
+
+    Este auditor lista os arquivos de ~/.local/state que nenhum script referencia
+    (por basename), com tamanho e data da ultima escrita. Nao apaga NADA: a
+    limpeza e' do dono. So mostra o que pode enganar.
+
+Como funciona: varre ~/bin, ~/hooks e ~/.config/opencode (incluindo as skills),
+junta os basenames citados e marca o que nao aparece em nenhum deles. Um arquivo
+citado pelo PROPRIO nome (ex.: 'bus-host.tsv' dentro de um script) conta como
+referenciado.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+STATE = os.path.join(HOME, ".local/state")
+FONTES = [os.path.join(HOME, "bin"), os.path.join(HOME, "hooks"),
+          os.path.join(HOME, ".config/opencode")]
+
+
+def texto_dos_fontes():
+    """Todo o texto que os scripts/configs da maquina citam.
+
+    MEDIDO 13/11: o proprio state-audit fala de 'bus-host.tsv' na docstring e
+    com isso o arquivo parecia 'referenciado' — o auditor se auto-citava.
+    Por isso o proprio arquivo e' excluido das fontes.
+    """
+    partes = []
+    eu = os.path.abspath(__file__)
+    for raiz in FONTES:
+        if not os.path.isdir(raiz):
+            continue
+        for dp, dns, fns in os.walk(raiz):
+            dns[:] = [d for d in dns if d not in ("__pycache__", ".git")]
+            for fn in fns:
+                p = os.path.join(dp, fn)
+                if os.path.abspath(p) == eu:
+                    continue
+                try:
+                    if os.path.getsize(p) > 4 * 1024 * 1024:
+                        continue
+                    with open(p, encoding="utf-8", errors="ignore") as fh:
+                        primeiro = fh.readline()
+                    # MEDIDO 13/11: filtrar por extensao perdia os scripts SEM
+                    # extensao (ex.: 'pendencia-job', 'crouton-nv-gate') — que
+                    # sao justamente os que escrevem os logs. Agora: texto com
+                    # shebang, extensao conhecida, ou arquivo pequeno sem binario.
+                    if not (primeiro.startswith("#!") or
+                            fn.endswith((".sh", ".py", ".md", ".json", ".js", ".mjs",
+                                         ".conf", ".env", ".txt", ".yaml", ".yml"))):
+                        if os.path.getsize(p) > 512 * 1024:
+                            continue
+                    with open(p, encoding="utf-8", errors="ignore") as fh:
+                        partes.append(fh.read())
+                except Exception:
+                    continue
+    return "\n".join(partes)
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--help", "-h", action="store_true")
+    a = ap.parse_args()
+    if a.help:
+        print(__doc__)
+        return 0
+
+    if not os.path.isdir(STATE):
+        print("sem ~/.local/state")
+        return 0
+    citada = texto_dos_fontes()
+    orfaos = []
+    total = 0
+    for nome in sorted(os.listdir(STATE)):
+        p = os.path.join(STATE, nome)
+        if not os.path.isfile(p):
+            continue
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        total += 1
+        # citado pelo basename (ou por um pedaco do nome sem extensao)
+        alvo = nome
+        if len(alvo) > 4 and alvo.endswith((".log", ".tsv", ".json", ".csv", ".txt")):
+            alvo = alvo.rsplit(".", 1)[0]
+        if alvo and alvo in citada:
+            continue
+        orfaos.append({
+            "arquivo": nome,
+            "bytes": st.st_size,
+            "ultima_escrita": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
+            "idade_dias": round((time.time() - st.st_mtime) / 86400, 1),
+        })
+
+    if a.json:
+        print(json.dumps({"arquivos": total, "orfaos": len(orfaos), "lista": orfaos},
+                         ensure_ascii=False, indent=1))
+        return 0
+
+    print("arquivos em ~/.local/state: %d | ORFAOS (nenhum script os cita): %d" % (total, len(orfaos)))
+    print()
+    print("%-34s %10s %-18s %s" % ("arquivo", "bytes", "ultima escrita", "idade (dias)"))
+    for o in sorted(orfaos, key=lambda x: -x["bytes"]):
+        print("%-34s %10d %-18s %s" % (o["arquivo"], o["bytes"], o["ultima_escrita"], o["idade_dias"]))
+    if orfaos:
+        print()
+        print("Um orfao nao e' inofensivo: parece fonte (tem data e registro) e mente em")
+        print("silencio. Este auditor NAO apaga nada — a limpeza e' do dono.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,110 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# nv-gate-phone - o gate de taxa do NIM free tier, LOCAL no Termux.
+#
+# POR QUE (medido em 10/11/2026, Crouton Alpha / celular):
+#   * o NIM free tier devolveu 429 em 1 de 3 requests DIRETOS -> o turno do
+#     opencode morre com "Too Many Requests" (o client so retry 3x e falha);
+#   * o effort=max do minimax custa 5,8 s de TTFB contra 1,1 s do medium
+#     (medido com a chave desta conta) -> o padrao do PC (max) nao serve aqui;
+#   * a sessao cresce ate 1,5 M tokens (5,4 MB) e o upstream recusa por
+#     context_length -> o gate learns o tamanho recusado e falha local (sem
+#     gastar upstream nem cota).
+#
+# O QUE O GATE NAO FAZ (nada de segredo): o header Authorization e repassado
+# intacto; o gate NUNCA ve nem guarda a chave. A cota e a desta conta (a
+# chave do celular e diferente da do PC — sha8 medido, sem vazar o valor).
+#
+# O CODIGO (nv-gate-phone.py) e o mesmo do PC: scripts/nv-gate.py do repo
+# nixos-ai (token bucket + retry de 429/502/503/504 + disjuntor de contexto
+# + via prioritaria para requests pequenos).
+#
+#   nv-gate-phone start     # sobe o gate (8195) + o watcher que o reergue
+#   nv-gate-phone stop      # para tudo
+#   nv-gate-phone status    # estado + contadores
+#   nv-gate-phone watch     # so o watcher (usado pelo boot)
+set -uo pipefail
+
+HOME=${HOME}
+PREFIX=/data/data/com.termux/files/usr
+STATE="$HOME/.local/state"
+LOG="$STATE/nv-gate-phone.log"
+PIDFILE="$STATE/nv-gate-phone.pid"
+WATCHPID="$STATE/nv-gate-phone.watch.pid"
+PORT=8195
+PY="$HOME/bin/nv-gate-phone.py"
+
+mkdir -p "$STATE"
+
+log() { echo "[$(date '+%d/%m %H:%M:%S')] $*" >> "$LOG"; }
+
+gate_up() {
+  timeout 5 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/$PORT" 2>/dev/null
+}
+
+start_gate() {
+  gate_up && { log "gate ja de pe na $PORT"; return 0; }
+  setsid nohup python3 "$PY" --port "$PORT" --rpm 24 --burst 4 --retry-budget 120 \
+    >> "$LOG" 2>&1 < /dev/null &
+  echo $! > "$PIDFILE"
+  sleep 3
+  if gate_up; then
+    log "gate de pe na $PORT (pid $(cat "$PIDFILE"))"
+    return 0
+  fi
+  log "FALHA ao subir o gate na $PORT"
+  tail -3 "$LOG" >> "$LOG" 2>/dev/null
+  return 1
+}
+
+start_watch() {
+  if [ -f "$WATCHPID" ] && kill -0 "$(cat "$WATCHPID" 2>/dev/null)" 2>/dev/null; then
+    log "watcher ja vivo (pid $(cat "$WATCHPID"))"
+    return 0
+  fi
+  setsid nohup "$0" watch >> "$LOG" 2>&1 < /dev/null &
+  echo $! > "$WATCHPID"
+  log "watcher iniciado (pid $!)"
+}
+
+watch_loop() {
+  log "watcher entrou no loop (a cada 30s confere o gate na $PORT)"
+  while true; do
+    if ! gate_up; then
+      log "gate FORA -> reerguendo"
+      start_gate
+    fi
+    sleep 30
+  done
+}
+
+case "${1:-status}" in
+  start)
+    start_gate && start_watch
+    ;;
+  stop)
+    for f in "$WATCHPID" "$PIDFILE"; do
+      p=$(cat "$f" 2>/dev/null)
+      [ -n "$p" ] && kill "$p" 2>/dev/null && log "parei o pid $p ($f)"
+      rm -f "$f"
+    done
+    pgrep -f "nv-gate-phone[.]py" 2>/dev/null | while read -r p; do kill "$p" 2>/dev/null; done
+    ;;
+  watch)
+    watch_loop
+    ;;
+  status)
+    echo "nv-gate-phone: porta $PORT"
+    if gate_up; then
+      echo "  gate: DE PE"
+    else
+      echo "  gate: FORA"
+    fi
+    echo "  watcher: $([ -f "$WATCHPID" ] && kill -0 "$(cat "$WATCHPID" 2>/dev/null)" 2>/dev/null && echo "rodando (pid $(cat "$WATCHPID"))" || echo "parado")"
+    timeout 10 curl -s -m 8 "http://127.0.0.1:$PORT/__gate/health" 2>/dev/null | head -c 400
+    echo
+    ;;
+  *)
+    echo "uso: nv-gate-phone {start|stop|status|watch}" >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,15 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# widget: ultimas 8 interacoes em TEXTO (pergunta, rota, latencia, resposta)
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+if [ -f ~/.local/state/assistant/log.jsonl ]; then
+  tail -8 ~/.local/state/assistant/log.jsonl | python3 -c '
+import json,sys
+for l in sys.stdin:
+ try:
+  d=json.loads(l)
+  print(str(d.get("ts",""))[11:19], str(d.get("route") or d.get("mode"))[:8], str(d.get("ms_total","?"))+"ms", str(d.get("q",""))[:26], "->", str(d.get("a","")).replace("\\n"," ")[:28])
+ except Exception: pass'
+else
+  printf '(sem log ainda)'
+fi

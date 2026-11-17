@@ -1,0 +1,26 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-leak - checagem de vazamento de IP antes de qualquer operacao no gateway.
+# Chama ~/bin/egress-guard check: mede o egress efetivo do container e ABORTA se
+# for o IP residencial do dono (o que faria o gateway ver o IP de casa).
+
+set -uo pipefail
+export PATH="$PATH:$HOME/bin"
+
+out=$(timeout 240 "$HOME/bin/egress-guard" check 2>&1)
+rc=$?
+
+if printf '%s' "$out" | grep -q "ABORTADO"; then
+  termux-toast "LEAK: egress nao seguro" >/dev/null 2>&1 || true
+  printf '%s\n' "$out" | tail -4
+  exit 1
+fi
+
+if printf '%s' "$out" | grep -q "IsTor:true"; then
+  termux-toast "Egress seguro (exit Tor)" >/dev/null 2>&1 || true
+  printf '%s\n' "$out" | tail -3
+  exit 0
+fi
+
+termux-toast "Leak check inconclusive" >/dev/null 2>&1 || true
+printf '%s\n' "$out" | tail -4
+exit "$rc"

@@ -1,0 +1,98 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-menu - menu principal (Termux:Widget) para o setup do Crouton Alpha.
+# Roda a acao escolhida e mostra o resultado. Sem acao: mostra o estado atual.
+#
+# Como usar: adicione um widget do Termux:Widget -> "crouton-menu".
+# O Termux:Widget mostra o stdout deste script.
+
+set -uo pipefail
+export PATH="$PATH:$HOME/bin"
+
+ONION="hvcxm2lfmllyypwa5vnbm2vkygtglac2zkwpo6ws6h3gfhudrwv754id.onion"
+W="$HOME/.termux/widget"
+
+say() { printf '%s\n' "$*"; }
+toast() { termux-toast "$1" >/dev/null 2>&1 || true; }
+
+tor_on()  { (exec 3<>/dev/tcp/127.0.0.1/9050) 2>/dev/null; }
+exit_tor() { proxychains4 -f "$HOME/.proxychains.conf" curl -s -m 20 https://check.torproject.org/api/ip 2>/dev/null; }
+
+# ---------- estado resumido ----------
+estado() {
+  say "== Crouton Alpha =="
+  if tor_on; then
+    say "Tor: LIGADO  $(exit_tor | head -c 60)"
+  else
+    say "Tor: PARADO"
+  fi
+  say "OpenCode: $(opencode --version 2>/dev/null | head -1)"
+  say "Servico: $(opencode service status 2>/dev/null | tail -1)"
+  say "Disco livre: $(df -h "$HOME" | awk 'NR==2{print $4}')"
+  say "Container vpnsec: $(timeout 8 bash -c "cat < /dev/null > /dev/tcp/${TA_LINUX_IP4:-100.121.100.103}/22" 2>/dev/null && echo 'host tailnet ok' || echo 'sem rota tailnet')"
+  say ""
+  say "Acoes: [1]status VPN  [2]leak check  [3]Tor on/off  [4]assistente  [5]sessoes  [6]retomar  [7]doctor  [8]IP"
+}
+
+acao() {
+  case "$1" in
+    1) bash "$W/crouton-vpn" ;;
+    2) bash "$W/crouton-leak" ;;
+    3)
+      if tor_on; then
+        pkill -f "tor -f $HOME/.torrc" 2>/dev/null
+        toast "Tor desligado"
+        say "Tor: PARADO (parado por voce)"
+      else
+        nohup tor -f "$HOME/.torrc" >/dev/null 2>&1 &
+        sleep 4
+        toast "Tor ligado"
+        say "Tor: LIGADO  $(exit_tor | head -c 60)"
+      fi
+      ;;
+    4) bash "$W/crouton-assistant" ;;
+    5) bash "$W/crouton-sessions" ;;
+    6) bash "$W/crouton-resume" ;;
+    7) bash "$W/crouton-doctor" ;;
+    9) bash "$W/crouton-onion" ;;
+    10) bash "$W/crouton-onion-up" ;;
+    11) bash "$W/crouton-bus" ;;
+    8)
+      ip=$(curl -s -m 12 https://api.ipify.org 2>/dev/null)
+      say "IP publico direto : ${ip:-desconhecido}"
+      if tor_on; then say "IP via Tor       : $(proxychains4 -f "$HOME/.proxychains.conf" curl -s -m 20 https://api.ipify.org 2>/dev/null)"; fi
+      ;;
+    *) estado ;;
+  esac
+}
+
+# ---------- menu interativo (dialog do Termux:API) ----------
+if command -v termux-dialog >/dev/null 2>&1; then
+  itens=(
+    "Status da cadeia VPN"
+    "Leak check (IP do dono nunca vai ao destino privado)"
+    "Tunel tunel: status (no container)"
+    "Tunel tunel: pedir ao host para subir"
+    "Barramento de coordenacao (outras IAs)"
+    "Ligar/Desligar Tor"
+    "Abrir o assistente por voz"
+    "Sessoes do OpenCode"
+    "Retomar a ultima sessao"
+    "Diagnostico (oc-doctor)"
+    "Ver meu IP"
+    "Sair"
+  )
+  IFS='|' read -r -a itens <<<"$(IFS='|'; echo "${itens[*]}")"
+  resp=$(termux-dialog -t "Crouton Alpha" -i "Escolha uma acao" -f "${itens[@]}" 2>/dev/null | jq -r '.text // .index // empty' 2>/dev/null)
+  idx=$(termux-dialog -t "Crouton Alpha" -i "Escolha" -f "${itens[@]}" 2>/dev/null | jq -r '.index // empty' 2>/dev/null)
+  if [[ -n "$idx" ]]; then
+    case "$idx" in
+      0) acao 1 ;; 1) acao 2 ;; 2) acao 9 ;; 3) acao 10 ;; 4) acao 11 ;;
+      5) acao 3 ;; 6) acao 4 ;; 7) acao 5 ;; 8) acao 6 ;;
+      9) acao 7 ;; 10) acao 8 ;;
+      *) say "ate mais" ;;
+    esac
+    exit 0
+  fi
+fi
+
+estado

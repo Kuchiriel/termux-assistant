@@ -1,0 +1,224 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""queue - fila/kanban por agente da frota (repo ai-mesh).
+
+O board vive em `~/ai-mesh/queue/board.json` — **POR HOST**: o arquivo esta no .gitignore
+e o host Linux nem tem board -> nao ha merge via git. Para tarefa entre agentes use o BUS;
+a fila e a lista local de cada maquina (medido 08/11).
+Cada item: id, title, owner, status (backlog|doing|blocked|done), ts, refs, ttl_h.
+
+    queue add "titulo" [--owner HOST] [--refs "a,b"] [--ttl H]
+    queue take <id|prefix>            # pega do backlog (status=doing)
+    queue done <id> [--note "..."]
+    queue block <id> "motivo"
+    queue reopen <id>
+    queue list [--owner HOST] [--status S]
+    queue mine                       # o que EU tenho em andamento
+    queue board                      # kanban em texto
+    queue expire                     # devolve 'doing' vencido (TTL) para backlog
+"""
+import json, os, sys, time, datetime, subprocess, hashlib
+
+MESH = os.environ.get("AI_MESH_DIR", os.path.expanduser("~/ai-mesh"))
+BOARD = os.path.join(MESH, "queue", "board.json")
+ME = os.environ.get("MESH_HOSTNAME", "termux")
+TTL_DEFAULT = float(os.environ.get("QUEUE_TTL_H", "6"))
+
+STATUSES = ("backlog", "doing", "blocked", "done")
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def load():
+    if not os.path.exists(BOARD):
+        return {"items": [], "updated": now()}
+    try:
+        with open(BOARD) as f:
+            d = json.load(f)
+        d.setdefault("items", [])
+        return d
+    except Exception:
+        return {"items": [], "updated": now()}
+
+
+def save(d):
+    os.makedirs(os.path.dirname(BOARD), exist_ok=True)
+    d["updated"] = now()
+    tmp = BOARD + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, BOARD)
+
+
+def new_id(items):
+    n = 1
+    used = {i.get("id") for i in items}
+    while f"q-{n:03d}" in used:
+        n += 1
+    return f"q-{n:03d}"
+
+
+def find(items, ref):
+    ref = str(ref)
+    exact = [i for i in items if i.get("id") == ref]
+    if exact:
+        return exact[0]
+    pref = [i for i in items if str(i.get("id", "")).startswith(ref)]
+    if len(pref) == 1:
+        return pref[0]
+    if len(pref) > 1:
+        print(f"ambiguo: {[i.get('id') for i in pref]}", file=sys.stderr)
+    return None
+
+
+def pull_best_effort():
+    try:
+        subprocess.run(["git", "-C", MESH, "pull", "--rebase", "-q"], timeout=60,
+                       capture_output=True)
+    except Exception:
+        pass
+
+
+def commit(msg):
+    try:
+        subprocess.run(["git", "-C", MESH, "add", "queue/board.json"], timeout=30, capture_output=True)
+        r = subprocess.run(["git", "-C", MESH, "commit", "-q", "-m", msg], timeout=60, capture_output=True, text=True)
+        if r.returncode == 0:
+            subprocess.run(["git", "-C", MESH, "push", "-q", "origin", "HEAD"], timeout=90, capture_output=True)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def expire(d):
+    changed = False
+    for i in d["items"]:
+        if i.get("status") == "doing":
+            ttl = float(i.get("ttl_h", TTL_DEFAULT))
+            ts = i.get("ts_taken") or i.get("ts") or ""
+            try:
+                t0 = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=datetime.timezone.utc).timestamp()
+            except Exception:
+                continue
+            if (time.time() - t0) / 3600 > ttl:
+                i["status"] = "backlog"
+                i["note"] = f"expirou (ttl {ttl}h) em {now()}"
+                i["owner"] = ""
+                changed = True
+    return changed
+
+
+def board_text(d):
+    linhas = []
+    linhas.append("KANBAN (fila da frota) — atualizado " + (d.get("updated") or "?"))
+    for st in STATUSES:
+        itens = [i for i in d["items"] if i.get("status") == st]
+        linhas.append(f"\n[{st.upper()}] ({len(itens)})")
+        for i in itens:
+            owner = i.get("owner") or "-"
+            ttl = f" ttl={i.get('ttl_h')}h" if i.get("ttl_h") else ""
+            linhas.append(f"  {i.get('id')} [{owner}]{ttl} {i.get('title')}")
+            if i.get("note"):
+                linhas.append(f"      nota: {i['note']}")
+            if i.get("refs"):
+                linhas.append(f"      refs: {', '.join(i['refs'])}")
+    return "\n".join(linhas)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__)
+        return 0
+    cmd = args[0]
+
+    def opt(name, default=None):
+        if name in args:
+            i = args.index(name)
+            if i + 1 < len(args):
+                return args[i + 1]
+        return default
+
+    if cmd == "add":
+        pull_best_effort()
+        d = load()
+        titulo = " ".join(a for a in args[1:] if not a.startswith("--") and
+                           a not in (opt("--owner"), opt("--refs"), opt("--ttl")))
+        if not titulo:
+            print("uso: queue add \"titulo\" [--owner H] [--refs a,b] [--ttl H]", file=sys.stderr)
+            return 2
+        item = {
+            "id": new_id(d["items"]),
+            "title": titulo,
+            "owner": opt("--owner", "") or "",
+            "status": "backlog",
+            "ts": now(),
+            "refs": [r.strip() for r in (opt("--refs", "") or "").split(",") if r.strip()],
+            "ttl_h": float(opt("--ttl", TTL_DEFAULT)),
+            "note": "",
+        }
+        d["items"].append(item)
+        save(d)
+        commit(f"queue: {item['id']} {titulo[:60]}")
+        print(f"{item['id']} criado (backlog){' owner=' + item['owner'] if item['owner'] else ''}")
+        return 0
+
+    pull_best_effort()
+    d = load()
+
+    if cmd in ("take", "done", "block", "reopen"):
+        it = find(d["items"], args[1] if len(args) > 1 else "")
+        if not it:
+            print("item nao encontrado", file=sys.stderr)
+            return 1
+        if cmd == "take":
+            it["status"] = "doing"; it["owner"] = ME; it["ts_taken"] = now()
+        elif cmd == "done":
+            it["status"] = "done"; it["owner"] = it.get("owner") or ME
+            it["note"] = opt("--note", it.get("note", ""))
+            it["ts_done"] = now()
+        elif cmd == "block":
+            it["status"] = "blocked"; it["owner"] = it.get("owner") or ME
+            it["note"] = " ".join(args[2:]) if len(args) > 2 else ""
+        elif cmd == "reopen":
+            it["status"] = "backlog"; it["owner"] = ""
+        save(d)
+        commit(f"queue: {it['id']} -> {it['status']}")
+        print(f"{it['id']} -> {it['status']}")
+        return 0
+
+    if cmd == "expire":
+        if expire(d):
+            save(d); commit("queue: expira itens vencidos")
+            print("itens expirados devolvidos ao backlog")
+        else:
+            print("nada expirado")
+        return 0
+
+    if cmd in ("list", "mine"):
+        status = opt("--status")
+        owner = ME if cmd == "mine" else opt("--owner")
+        for i in d["items"]:
+            if status and i.get("status") != status:
+                continue
+            if owner and i.get("owner") != owner:
+                continue
+            print(f"{i.get('id'):8s} {i.get('status'):8s} [{i.get('owner') or '-':10s}] {i.get('title')}")
+            if i.get("note"):
+                print(f"         nota: {i['note']}")
+        return 0
+
+    if cmd == "board":
+        print(board_text(d))
+        return 0
+
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

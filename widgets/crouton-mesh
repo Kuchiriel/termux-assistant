@@ -1,0 +1,33 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-mesh - estado da malha de confianca (tailnet) na tela inicial.
+# Toca aqui: aplica as chaves dos peers que publicaram manifesto no bus.
+# Falha fechada: nada e apagado, so authorized_keys que RECEBO.
+
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+
+ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}' | grep -E '^100\.' | head -1)
+if [ -z "$ip" ]; then
+  echo "SEM TAILNET (ligue o Tailscale)"
+  exit 0
+fi
+
+# aplica o que houver de novo no bus (idempotente)
+apply_out=$(timeout 120 "$HOME/bin/mesh-sync" apply 2>&1 | grep -E "INSTALADO|ja instalado|sem pubkey|manifesto" | head -4)
+if [ -n "$apply_out" ]; then
+  termux-toast "Malha atualizada" >/dev/null 2>&1 || true
+fi
+
+# estado
+linhas=""
+for hp in "termux:$ip:8022" "nitrov15:${TA_LINUX_IP4:-100.121.100.103}:22" "windows:100.123.236.2:22"; do
+  IFS=: read -r nome host prt <<<"$hp"
+  prt="${prt:-22}"
+  if timeout 4 bash -c "cat < /dev/null > /dev/tcp/$host/$prt" 2>/dev/null; then st="ok"; else st="--"; fi
+  linhas="$linhas $nome=$st"
+done
+peers=$(python3 "$HOME/.config/mesh/manifest.py" keys 2>/dev/null | wc -l | tr -d ' ')
+conf=$(wc -l < "$HOME/.ssh/authorized_keys" 2>/dev/null || echo 0)
+
+printf 'MESH %s | peers no bus:%s | chaves que eu confio:%s%s\n' \
+  "${linhas# }" "$peers" "$conf" "$(printf '\n%s' "$apply_out" | head -2)"

@@ -1,0 +1,29 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# hub-token.sh — acesso ao Agent Hub (mission control) do nitro-v15.
+#
+# O hub exige 'x-agent-hub-token' nas rotas sensiveis (transcript/wake).
+# A pagina tem um campo 'token do hub' no topo: cole o token uma vez.
+#
+#   hub-token.sh          -> mostra o token
+#   hub-token.sh --url    -> mostra a URL do hub
+#   hub-token.sh --copy   -> copia o token pra area de transferencia
+#   hub-token.sh --open   -> URL + token prontos pra colar no navegador
+set -uo pipefail
+HOST_IP="${HUB_HOST:-${TA_LINUX_HOST6:-fd7a:115c:a1e0::7f01:64bd}}"
+REMOTE="${TA_LINUX_USER:-nixos}@$HOST_IP"
+TOK=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" 'cat ~/.config/opencode/agent-hub.token' 2>/dev/null | tr -d '\r\n')
+if [ -z "$TOK" ]; then
+  echo "ERRO: nao consegui ler o token do hub (SSH ou arquivo ausente)" >&2
+  exit 1
+fi
+case "${1:-}" in
+  --url)  echo "http://[$HOST_IP]:8091/" ;;
+  --copy) printf '%s' "$TOK" | termux-clipboard-set 2>/dev/null && echo "(token copiado)" ;;
+  --open)
+    echo "URL:   http://[$HOST_IP]:8091/"
+    echo "TOKEN: $TOK"
+    echo
+    echo "No navegador: abra a URL, cole o token no campo 'token do hub' (canto superior), e o painel conecta."
+    ;;
+  *)      echo "$TOK" ;;
+esac

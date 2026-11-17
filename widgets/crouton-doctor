@@ -1,0 +1,31 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-doctor - resumo do diagnostico Termux/OpenCode (versao curta do oc-doctor).
+
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+say() { printf '%s\n' "$*"; }
+
+say "== Termux =="
+say "  $(dpkg-query -W -f='${Version}' termux-tools 2>/dev/null)"
+say "  disco livre: $(df -h "$HOME" | awk 'NR==2{print $4}')"
+say ""
+say "== OpenCode =="
+for b in opencode opencode2; do
+  command -v "$b" >/dev/null 2>&1 && say "  $b: $($b --version 2>/dev/null | head -1)"
+done
+say "  servico 2.2.5: $(opencode service status 2>/dev/null | tail -1)"
+say "  identidade: $(~/bin/oc-identidade --json 2>/dev/null | sed 's/.*"model":"\([^"]*\)".*"variant":"\([^"]*\)".*/\1 (variante \2)/')"
+say ""
+say "== MCPs =="
+mcp=$(timeout 30 opencode api GET /api/config 2>/dev/null | jq -r '
+  [(.data // .)[] | select(.type=="document") | (.info.mcp.servers // {}) | keys[]] | flatten | unique | join(", ")' 2>/dev/null)
+[[ -z "$mcp" ]] && mcp=$(timeout 30 opencode mcp list 2>/dev/null | awk 'NF>=2 {print $2}' | grep -v "^$" | paste -sd, -)
+say "  ${mcp:-nenhum}"
+say ""
+say "== Rede =="
+if (exec 3<>/dev/tcp/127.0.0.1/9050) 2>/dev/null; then
+  say "  Tor: LIGADO ($(proxychains4 -f "$HOME/.proxychains.conf" curl -s -m 20 https://api.ipify.org 2>/dev/null))"
+else
+  say "  Tor: PARADO"
+fi
+say "  coord-mcp: $(timeout 5 bash -c 'cat < /dev/null > /dev/tcp/${TA_LINUX_IP4:-100.121.100.103}/8765' 2>/dev/null && echo alcancavel || echo sem rota)"

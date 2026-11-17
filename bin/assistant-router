@@ -1,0 +1,102 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# assistant-router — roteia a pergunta pelo caminho mais barato e disponível.
+#
+# Padrão do paper 2603.09180 (DuplexCascade): micro-turns + cascade. Aqui a
+# "cascade" e' por CUSTO/DISPONIBILIDADE, nao por_audio:
+#   1) comando local do Termux     -> termux_bot.sh run_local   (~0-2 s, sem rede)
+#   2) sobrevivencia/blackout      -> offline (corpus FTS5)     (~0.9 s, sem rede)
+#   3) estado da casa (lab/frota)  -> house/lab CLI (via SSH)   (~1-3 s)
+#   4) inteligencia geral          -> assistant-fast (API)      (~6-12 s, com rede)
+#
+# Tudo grava log JSONL com latencia por etapa. Nunca expoe segredo.
+set -uo pipefail
+export PATH="$PATH:$HOME/bin"
+
+LOG="${ASSISTANT_LOG:-$HOME/.local/state/assistant/log.jsonl}"
+mkdir -p "$(dirname "$LOG")"
+Q=""
+SPEAK=0
+SHOW_ROUTE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --speak) SPEAK=1; shift ;;
+    --route) SHOW_ROUTE=1; shift ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+    *) Q="${Q:+$Q }$1"; shift ;;
+  esac
+done
+[ -z "$Q" ] && { echo "uso: assistant-router [--route] [--speak] 'pergunta'"; exit 2; }
+
+ms() { date +%s%3N; }
+T0=$(ms)
+
+local_match() {
+  printf '%s' "$Q" | grep -qiE "bateria|notificac|endereco de ip|meu ip|localiza|onde estou|wi.?fi|bluetooth|lanterna|temperatura|armazenamento|espaco|processo|uptime" && return 0
+  return 1
+}
+offline_match() {
+  printf '%s' "$Q" | grep -qiE "purificar|agua potavel|primeiros socorros|sobreviv|abrigo|fogo|ferida|hemorragia|envenen|desidrat|emerg|kits?|nucle|rabi|hipoterm|ferramentas manual" && return 0
+  return 1
+}
+house_match() {
+  printf '%s' "$Q" | grep -qiE "laboratorio|a/b|lab|frota|agentes|modelo|vram|gpu|medic|checker|estado da casa|quem esta" && return 0
+  return 1
+}
+
+if local_match; then
+  ROUTE="local"
+  R=$(cd "$HOME" && timeout 20 "$HOME/projects/termux-assistant/termux_bot.sh" --quiet --no-tts "$Q" 2>/dev/null)
+elif offline_match; then
+  ROUTE="offline"
+  R=$(timeout 25 "$HOME/bin/offline" "$Q" -k 2 2>/dev/null | head -c 1200)
+elif house_match; then
+  ROUTE="house"
+  R=$(timeout 45 "$HOME/bin/house" status 2>/dev/null | head -c 900)
+  [ -z "$R" ] && R=$(timeout 45 "$HOME/bin/lab" status 2>/dev/null | tail -12)
+else
+  # GATE DE INCERTECA (metacognicao barata): antes de pagar API, pergunta ao
+  # corpus local se existe fonte. Se houver, a resposta e' grounded e nao
+  # depende de rede. Se nao houver, chama a API e MARCA a ausencia de fonte.
+  LOCAL=$(timeout 25 "$HOME/bin/offline" "$Q" -k 1 --json 2>/dev/null | python3 -c '
+import json,sys
+try:
+ d=json.load(sys.stdin)
+ rs=d.get("results") or d.get("docs") or []
+ print(rs[0].get("score",0) if rs else 0)
+except Exception: print(0)' 2>/dev/null)
+  if [ -n "$LOCAL" ] && python3 -c "import sys;sys.exit(0 if float(sys.argv[1])>=20 else 1)" "$LOCAL" 2>/dev/null; then
+    ROUTE="offline-fallback"
+    R=$(timeout 25 "$HOME/bin/offline" "$Q" -k 2 2>/dev/null | head -c 1200)
+  else
+    ROUTE="api"
+    R=$(timeout 120 "$HOME/bin/assistant-fast" --text "$Q" 2>/dev/null)
+    case "$R" in
+      *"não sei"*|*"nao sei"*|*"provavelmente"*|*"talvez"*) ;;
+      *) R="[sem fonte local — verificar] $R" ;;
+    esac
+  fi
+fi
+[ -z "$R" ] && R="(sem resposta no caminho $ROUTE)"
+T1=$(ms)
+
+T2=$T1
+if [ "$SPEAK" = "1" ] && command -v termux-tts-speak >/dev/null 2>&1; then
+  FALA=$(printf '%s' "$R" | sed 's/[.,!?;:]/ /g' | head -c 400)
+  termux-tts-speak -l pt-br "$FALA" >/dev/null 2>&1 || true
+  T2=$(ms)
+fi
+
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+python3 - "$LOG" "$TS" "$ROUTE" "$Q" "$R" "$T0" "$T1" "$T2" <<'PY'
+import json, sys
+p,ts,route,q,a,t0,t1,t2=sys.argv[1:9]
+d={"ts":ts,"mode":"router","route":route,"q":q[:250],"a":a[:500],
+   "ms_route":int(t1)-int(t0),"ms_tts":int(t2)-int(t1),"ms_total":int(t2)-int(t0)}
+try:
+    open(p,"a",encoding="utf-8").write(json.dumps(d,ensure_ascii=False)+"\n")
+except Exception:
+    pass
+PY
+
+[ "$SHOW_ROUTE" = "1" ] && printf '[rota=%s %sms]\n' "$ROUTE" "$((T1-T0))"
+printf '%s\n' "$R"

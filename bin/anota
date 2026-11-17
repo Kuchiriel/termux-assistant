@@ -1,0 +1,263 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""anota - captura uma ideia em segundos (voz, dialogo ou texto) e guarda com hora.
+
+POR QUE EXISTE: ideia boa morre no caminho entre "pensar" e "abrir o app certo".
+Aqui: um toque no widget -> fala (ou digita) -> fica gravado, com hora, pesquisavel.
+
+    anota                     # abre o campo de texto (dialogo do Android)
+    anota --falar             # fala -> transcreve (usar no widget)
+    anota "comprar pilha"     # nota direta
+    anota --gravar 30         # so grava audio (30 s) em ~/notes/audio/
+    anota --ultimas 10        # as ultimas notas
+    anota --busca "pilha"     # procura nas notas
+    anota --mesh              # tambem grava na memoria episodica da frota
+    anota --json ...
+
+ONDE FICA: ~/notes/inbox.jsonl  (+ ~/notes/audio/*.m4a nas gravacoes)
+PRIVACIDADE: local. So vai pro ai-mesh com --mesh (e ai vira texto no repo privado).
+
+LIMITE CONHECIDO: `termux-speech-to-text` depende do reconhecedor do Google e so
+abre a folha de fala quando o Termux esta em primeiro plano (widget/TUI). Rodando
+no background do agente ele volta vazio — por isso o fallback para o dialogo.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import subprocess
+import sys
+import unicodedata
+
+HOME = os.path.expanduser("~")
+NOTES = os.path.join(HOME, "notes")
+CAIXA = os.path.join(NOTES, "inbox.jsonl")
+AUDIO = os.path.join(NOTES, "audio")
+EPISODIC = os.path.join(HOME, "ai-mesh/memory/episodic/termux.jsonl")
+
+
+def rodar(cmd, timeout=60, entrada=None):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           input=entrada)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except Exception as e:  # noqa: BLE001
+        return 1, "", str(e)
+
+
+def norm(t):
+    t = unicodedata.normalize("NFKD", t or "")
+    return "".join(c for c in t if not unicodedata.combining(c)).lower()
+
+
+def agora_local():
+    return dt.datetime.now().replace(microsecond=0)
+
+
+def agora_utc():
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def avisar(msg):
+    rodar(["termux-toast", "-g", "middle", msg[:110]], timeout=10)
+
+
+# ------------------------------------------------------------------ captura
+def por_fala():
+    """tenta transcrever; devolve (texto, motivo_da_falha)."""
+    rc, out, err = rodar(["termux-speech-to-text"], timeout=90)
+    if rc != 0:
+        return None, (err.strip().splitlines()[-1][:120] if err.strip() else "rc=%d" % rc)
+    out = (out or "").strip()
+    if not out:
+        return None, "reconhecedor devolveu vazio (microfone/permissao/1o plano)"
+    try:
+        d = json.loads(out)
+        txt = d.get("text") or d.get("result") or ""
+    except Exception:  # noqa: BLE001
+        txt = out
+    txt = (txt or "").strip()
+    if not txt:
+        return None, "sem texto reconhecido"
+    return txt, None
+
+
+def por_dialogo(titulo="Anotar", dica="ideia, tarefa, lembrete..."):
+    rc, out, err = rodar(["termux-dialog", "-t", titulo, "-i", dica], timeout=300)
+    if rc != 0:
+        return None, (err.strip()[:120] or "dialogo indisponivel")
+    try:
+        d = json.loads(out)
+    except Exception:  # noqa: BLE001
+        return None, "resposta inesperada do dialogo (%s)" % (out.strip()[:60] or "vazio")
+    if d.get("code") in (-1, -2) and not d.get("text"):
+        return None, "cancelado"
+    txt = (d.get("text") or "").strip()
+    return (txt, None) if txt else (None, "vazio")
+
+
+def por_audio(segundos):
+    os.makedirs(AUDIO, exist_ok=True)
+    alvo = os.path.join(AUDIO, agora_local().strftime("%Y-%m-%d_%H%M%S") + ".m4a")
+    rc, _, err = rodar(["termux-microphone-record", "-f", alvo, "-l",
+                        str(max(1, segundos))], timeout=30)
+    if rc != 0:
+        return None, (err.strip()[:120] or "gravador indisponivel")
+    return alvo, None
+
+
+# ------------------------------------------------------------------- guardar
+def guardar(texto, tipo, extra=None, mesh=False):
+    os.makedirs(NOTES, exist_ok=True)
+    agora = agora_local()
+    reg = {"ts": agora.isoformat(), "epoch": int(agora.timestamp()),
+           "tipo": tipo, "texto": texto}
+    if extra:
+        reg.update(extra)
+    with open(CAIXA, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(reg, ensure_ascii=False) + "\n")
+
+    if mesh:
+        os.makedirs(os.path.dirname(EPISODIC), exist_ok=True)
+        ep = {"ts": agora_utc(), "host": "termux", "kind": "nota",
+              "tags": ["dono", "anotacao", tipo],
+              "text": texto[:1500]}
+        with open(EPISODIC, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(ep, ensure_ascii=False) + "\n")
+    return reg
+
+
+def ler_caixa():
+    if not os.path.isfile(CAIXA):
+        return []
+    out = []
+    with open(CAIXA, encoding="utf-8") as fh:
+        for linha in fh:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                out.append(json.loads(linha))
+            except Exception:  # noqa: BLE001
+                continue
+    return out
+
+
+# --------------------------------------------------------------------- acoes
+def acao_anotar(args):
+    tipo = "texto"
+    texto = None
+    extra = {}
+
+    if args.audio:
+        arq, erro = por_audio(args.audio)
+        if erro:
+            print("nao consegui gravar: %s" % erro, file=sys.stderr)
+            return 2
+        texto = "[audio] %s" % os.path.basename(arq)
+        tipo = "audio"
+        extra = {"arquivo": arq, "segundos": args.audio}
+        avisar("Audio salvo (%ds)" % args.audio)
+
+    elif args.texto:
+        texto = " ".join(args.texto).strip()
+
+    elif args.falar:
+        texto, motivo = por_fala()
+        if texto:
+            tipo = "voz"
+        else:
+            # widget: se a fala falhar, cai no dialogo — nao perde a ideia
+            texto, motivo2 = por_dialogo("Anotar (fala falhou)")
+            if not texto:
+                if motivo2 != "cancelado":
+                    print("fala: %s\ndialogo: %s" % (motivo, motivo2), file=sys.stderr)
+                    return 2
+                print("cancelado.", file=sys.stderr)
+                return 1
+            tipo = "texto"
+
+    else:
+        texto, motivo = por_dialogo()
+        if not texto:
+            if motivo == "cancelado":
+                print("cancelado.", file=sys.stderr)
+                return 1
+            print("nada anotado (%s)" % motivo, file=sys.stderr)
+            return 2
+        tipo = "texto"
+
+    if not texto:
+        print("nada anotado (texto vazio).", file=sys.stderr)
+        return 1
+
+    reg = guardar(texto, tipo, extra, mesh=args.mesh)
+    if args.json:
+        print(json.dumps(reg, ensure_ascii=False))
+    else:
+        print("anotado (%s, %s): %s"
+              % (tipo, reg["ts"][11:16], texto[:200]))
+        if args.mesh:
+            print("          tambem na memoria episodica da frota")
+    avisar("Anotado")
+    return 0
+
+
+def acao_ultimas(args):
+    notas = ler_caixa()
+    if not notas:
+        print("nenhuma nota ainda. `anota` para a primeira.")
+        return 0
+    sel = notas[-args.ultimas:]
+    if args.json:
+        print(json.dumps(sel, ensure_ascii=False, indent=1))
+        return 0
+    for n in reversed(sel):
+        print("%s  [%s] %s" % (n["ts"][:16].replace("T", " "), n.get("tipo", "?"),
+                               n["texto"][:160].replace("\n", " ")))
+    print("\n%d nota(s) no total" % len(notas))
+    return 0
+
+
+def acao_busca(args):
+    notas = ler_caixa()
+    alvo = norm(args.busca)
+    achados = [n for n in notas if alvo in norm(n.get("texto", ""))]
+    if args.json:
+        print(json.dumps(achados, ensure_ascii=False, indent=1))
+        return 0 if achados else 1
+    print("%d nota(s) com \"%s\":" % (len(achados), args.busca))
+    for n in achados[-args.ultimas:]:
+        print("  %s  %s" % (n["ts"][:16].replace("T", " "), n["texto"][:150]))
+    return 0 if achados else 1
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(
+        prog="anota", description="anota uma ideia (voz, dialogo ou texto)",
+        epilog="ex.: anota 'ligar pro sindicato'   |   anota --falar")
+    ap.add_argument("texto", nargs="*", help="o texto da nota")
+    ap.add_argument("--falar", action="store_true", help="tenta voz -> texto")
+    ap.add_argument("--gravar", dest="audio", type=int, nargs="?", const=30,
+                    metavar="SEG", help="grava audio (padrao 30 s)")
+    ap.add_argument("--ultimas", type=int, default=10, help="quantas mostrar")
+    ap.add_argument("--listar", "--lista", dest="listar", action="store_true",
+                    help="mostra as ultimas notas")
+    ap.add_argument("--busca", help="procura nas notas")
+    ap.add_argument("--mesh", action="store_true", help="grava tambem na memoria da frota")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+
+    if a.busca:
+        return acao_busca(a)
+    if a.listar:
+        return acao_ultimas(a)
+    return acao_anotar(a)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

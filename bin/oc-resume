@@ -1,0 +1,6 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Retoma uma sessão do OpenCode v2. Uso: oc-resume <session-id>
+# Rode em um terminal novo (não dentro da TUI atual).
+set -eu
+[ $# -eq 1 ] || { echo "uso: oc-resume ses_..."; exit 1; }
+exec opencode2 --session "$1"

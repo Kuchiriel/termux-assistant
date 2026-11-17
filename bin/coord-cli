@@ -1,0 +1,223 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""coord-cli - cliente do coord-mcp (MCP streamable-http) do host Linux.
+
+Fala direto com o coord-mcp do host Linux, sem depender do cliente MCP do
+OpenCode (que pode ficar com conexão velha depois de o Tailscale piscar).
+
+MEDIDO 16/11: a rota IPv4 celular->PC pode estar morta enquanto o IPv6
+${TA_LINUX_HOST6:-fd7a:115c:a1e0::7f01:64bd} responde. O resolver testa IPv4, depois IPv6 e so
+entao usa o tunel SSH pela LAN.
+
+MEDIDO 14/11: a rota celular->PC pela tailnet ficou assimétrica, mas a LAN
+${TA_LINUX_LAN:-192.168.15.10} continua. O `mcp` já abre um túnel SSH porDemand; este cliente
+passa a reutilizar o mesmo túnel local (127.0.0.1:18765) e, se ele não existe,
+cria o próprio. MCP_LAN=0 desliga o fallback; MCP_LAN=1 força o túnel.
+
+    coord-cli peers                       # quem o Linux alcança na tailnet
+    coord-cli roster                      # quem é quem no roster local
+    coord-cli read                        # estado do bus
+    coord-cli pending                     # o que te cabe
+    coord-cli msg <codinome> "<texto>"    # entrega direta na sessão do peer
+    coord-cli post --kind msg --to <cod> --note "<texto>"  # publica no bus
+    coord-cli whoami
+
+O MCP exige: POST /mcp com Accept: application/json, text/event-stream; o
+servidor devolve o id de sessão no header Mcp-Session-Id.
+"""
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+DIRECT_URL = os.environ.get("COORD_MCP_URL", "http://${TA_LINUX_IP4:-100.121.100.103}:8765/mcp")
+DIRECT_URL6 = os.environ.get("COORD_MCP_URL6", "http://[${TA_LINUX_HOST6:-fd7a:115c:a1e0::7f01:64bd}]:8765/mcp")
+HDRS = {"Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream"}
+LOCAL_PORT = 18765
+LAN_SSH = os.environ.get("MCP_LAN_SSH", "${TA_LINUX_USER:-nixos}@${TA_LINUX_LAN:-192.168.15.10}")
+
+
+def _aberto(host, porta, timeout=0.8):
+    # socket.create_connection escolhe IPv4 ou IPv6 conforme o endereco.
+    # O connect((host, porta)) legado falhava para o endereco IPv6 do host.
+    try:
+        with socket.create_connection((host, porta), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _tunel(host, porta):
+    """Garante 127.0.0.1:18765 -> host-remoto:porta via SSH pela LAN."""
+    if _aberto("127.0.0.1", LOCAL_PORT):
+        return LOCAL_PORT
+    try:
+        subprocess.run(
+            ["ssh", "-f", "-N", "-o", "BatchMode=yes",
+             "-o", "ConnectTimeout=8", "-o", "ExitOnForwardFailure=yes",
+             "-o", "ServerAliveInterval=30",
+             "-L", "%d:%s:%d" % (LOCAL_PORT, host, porta), LAN_SSH],
+            capture_output=True, timeout=25, check=False)
+    except Exception:
+        return None
+    return LOCAL_PORT if _aberto("127.0.0.1", LOCAL_PORT) else None
+
+
+def resolver_url():
+    """IPv4 direto -> IPv6 direto -> túnel SSH pela LAN."""
+    if "COORD_MCP_URL" in os.environ:
+        return DIRECT_URL, "explicita"
+    modo = os.environ.get("MCP_LAN", "auto")
+    u = urllib.parse.urlparse(DIRECT_URL)
+    host = u.hostname or "${TA_LINUX_IP4:-100.121.100.103}"
+    porta = u.port or 80
+
+    # MCP_LAN=1 força o túnel; MCP_LAN=0 só desliga o fallback LAN, mas ainda
+    # permite as duas rotas diretas que estão de pé.
+    if modo != "1":
+        for url, label in ((DIRECT_URL, "direta-ipv4"),
+                           (DIRECT_URL6, "direta-ipv6")):
+            if not url:
+                continue
+            du = urllib.parse.urlparse(url)
+            dh = du.hostname
+            dp = du.port or 80
+            timeout = 2.0 if label == "direta-ipv6" else 0.8
+            if dh and _aberto(dh, dp, timeout=timeout):
+                return url, label
+
+    if modo == "0":
+        return DIRECT_URL, "direta-sem-fallback"
+
+    local = _tunel(host, porta)
+    if local:
+        return "http://127.0.0.1:%d%s" % (local, u.path or "/mcp"), "LAN"
+    return DIRECT_URL, "direta-sem-tunel"
+
+
+def refresh_route():
+    """Reescolhe IPv4/IPv6/túnel e atualiza a rota global."""
+    global URL, ROUTE
+    URL, ROUTE = resolver_url()
+    return URL, ROUTE
+
+
+URL, ROUTE = refresh_route()
+
+
+def post(payload, session=None):
+    h = dict(HDRS)
+    if session:
+        h["Mcp-Session-Id"] = session
+    req = urllib.request.Request(URL, data=json.dumps(payload).encode(), headers=h, method="POST")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        sid = r.headers.get("Mcp-Session-Id")
+        body = r.read().decode("utf-8", "ignore")
+    # resposta pode ser JSON puro ou SSE (data: ...)
+    out = []
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if line.startswith("{"):
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+    return out, sid
+
+
+def call(tool, args=None):
+    # MEDIDO 16/11: a rota IPv6 oscilou; o TCP probe passava e a primeira POST
+    # initialize podia expirar. Só o initialize e' repetido: ele apenas abre
+    # uma sessao nova. tools/call NAO e' repetido, porque coord_msg e outras
+    # ferramentas podem ter efeito externo e duplicar uma entrega seria pior.
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                          "clientInfo": {"name": "coord-cli", "version": "1"}}}
+    init = []
+    sid = None
+    for attempt in range(3):
+        try:
+            # A rota pode ter caído entre a escolha inicial e esta tentativa.
+            # Re-resolve ANTES do initialize; tools/call abaixo nunca e' repetido.
+            refresh_route()
+            init, sid = post(payload)
+            break
+        except (urllib.error.URLError, OSError):
+            if attempt == 2:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+    if not sid:
+        # sem header de sessao: tenta usar o id do initialize
+        for o in init:
+            sid = (o.get("result") or {}).get("sessionId") or sid
+    try:
+        post({"jsonrpc": "2.0", "method": "notifications/initialized"}, sid)
+    except Exception:
+        pass
+    resp, _ = post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                     "params": {"name": tool, "arguments": args or {}}}, sid)
+    for o in resp:
+        res = o.get("result")
+        if isinstance(res, dict):
+            for c in res.get("content", []):
+                if c.get("type") == "text":
+                    return c.get("text", "")
+    return json.dumps(resp)[:2000]
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "peers"
+    if cmd == "msg":
+        to = sys.argv[2]
+        msg = sys.argv[3] if len(sys.argv) > 3 else ""
+        result = call("coord_msg", {"to": to, "message": msg, "note": False})
+        print(result)
+        # MEDIDO 17/11: agent-msg pode responder 208 dedupe e dizer que o
+        # request NAO foi reenfileirado. Antes, coord-cli ainda terminava rc=0,
+        # e automacao interpretava isso como entrega. Nao repetimos o texto:
+        # apenas sinalizamos que o pedido precisa de outra tentativa humana/
+        # upstream, depois de corrigida a chave de dedupe.
+        lower = result.lower()
+        if "dedupe" in lower or "nao reenfileirado" in lower or "não reenfileirado" in lower:
+            print("coord-cli: NAO ENFILEIRADO (dedupe do agent-msg)", file=sys.stderr)
+            raise SystemExit(2)
+    elif cmd == "post":
+        args = {}
+        i = 2
+        while i < len(sys.argv):
+            k = sys.argv[i]
+            if k.startswith("--"):
+                args[k[2:]] = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+                i += 2
+            else:
+                i += 1
+        print(call("coord_post", args))
+    elif cmd == "notify":
+        msg = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else ""
+        print(call("coord_notify", {"message": msg}))
+    elif cmd == "recall":
+        q = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else ""
+        print(call("coord_recall", {"query": q}))
+    elif cmd == "lessons":
+        q = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else ""
+        print(call("coord_lessons", {"query": q}))
+    elif cmd == "workitem":
+        print(call("coord_workitem", {}))
+    else:
+        print(call("coord_" + cmd, {}))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print("coord-cli: %s: %s (rota=%s)" %
+              (type(exc).__name__, str(exc)[:180], ROUTE), file=sys.stderr)
+        sys.exit(1)

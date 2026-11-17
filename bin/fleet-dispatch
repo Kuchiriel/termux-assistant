@@ -1,0 +1,49 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# fleet-dispatch — pega a proxima tarefa da fila e acorda um agente IDLE.
+#
+# Fecha o loop que faltava: antes o watchdog so destravava inbox, mas ninguem
+# punha trabalho novo -> frota toda idle. Agora: workitem -> agente idle ->
+# wake steer -> claim -> bus.
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+
+MQ() { timeout 60 ~/bin/mcp call coord_workitem "$1" 2>/dev/null; }
+LOG="${FLEET_DISPATCH_LOG:-$HOME/.local/state/fleet-dispatch.log}"
+say() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >> "$LOG"; }
+
+[ "${1:-}" = "--help" ] && { sed -n '2,8p' "$0"; exit 0; }
+# rastro para o jobs-audit (convencao: ~/.local/state/job-<nome>.trace)
+mkdir -p "$HOME/.local/state"
+: > "$HOME/.local/state/job-fleet-dispatch.trace"
+
+NEXT=$(MQ '{"action":"next","project":"frota"}')
+case "$NEXT" in
+  *'"id"'*) ;;
+  *) echo "(fila vazia)"; exit 0 ;;
+esac
+
+ITEM=$(printf '%s' "$NEXT" | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(""); raise SystemExit
+print(d.get("id","")+"\t"+d.get("description",""))')
+IID=${ITEM%%$'\t'*}
+DESC=${ITEM#*$'\t'}
+[ -z "$IID" ] && { echo "(sem id)"; exit 0; }
+
+# escolhe um agente IDLE (nao spawn, que custa caro e demora)
+AGENT=$(timeout 20 curl -s http://nitro-v15.tailbcc368.ts.net/hub/api/agents \
+  | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit
+for a in d.get("agents",[]):
+ if a.get("status")=="idle" and not str(a.get("codename","")).startswith("spawn"):
+  print(a["codename"]); break' 2>/dev/null)
+[ -z "$AGENT" ] && { echo "(nenhum agente idle)"; exit 0; }
+
+TAREA="ID:$IID FILA DA FROTA — $DESC. ACEITE: artefato commitado no repo canônico + 1 linha no bus (issue #12). Ao terminar, marque o item done (coord_workitem action=done item_id=$IID project=frota) e rode: ~/projects/nixos-ai/scripts/fleet-dispatch — para acordar o próximo agente. Não responda só 'feito': entregue."
+OUT=$(timeout 60 ~/bin/wake-direct "$AGENT" "$TAREA" 2>&1 | head -2)
+CLAIM=$(MQ "$(python3 -c 'import json,sys;print(json.dumps({"action":"claim","item_id":sys.argv[1],"project":"frota","reason":sys.argv[2]},ensure_ascii=False))' "$IID" "$AGENT")" 2>&1 | head -c 120)
+
+printf '%s\n' "$OUT"
+echo "item=$IID agente=$AGENT claim=$CLAIM"
+say "item=$IID agente=$AGENT :: $DESC :: $OUT"

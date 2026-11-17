@@ -1,0 +1,150 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""api-contract - qual payload o /prompt aceita? SEM escrever nada.
+
+MEDIDO 09/11/2026 (celular 2.2.5 e host 2.2.6): POST /api/session/<id>/prompt aceita
+{"text":"..."} (+ "delivery") -> 200.  {"prompt":{"text":...}} -> 400 "Missing key at [text]".
+(A licao de 08/11 na skill fleet-comm estava INVERTIDA e isso quebrou o wake da frota.)
+
+Como descobrir sem criar mensagem: mandar um corpo INVALIDO ({}). A resposta 400 diz
+QUAL chave falta ("Missing key at [text]" = quer 'text'; "at [prompt]" = quer 'prompt').
+Nenhuma mensagem e criada (a validacao falha antes).
+
+  api-contract            # celular (127.0.0.1:52031) + host (tailnet:4599, leitura)
+  api-contract --json
+"""
+import json, os, sys, base64, urllib.request, urllib.error, subprocess
+
+HOME = os.path.expanduser("~")
+STATE = os.path.join(HOME, ".local/state")
+
+
+def senha_local():
+    for f in ("service-stable.json", "service-android-termux.json"):
+        p = os.path.join(HOME, ".config/opencode", f)
+        try:
+            d = json.load(open(p))
+            if d.get("password"):
+                return d["password"]
+        except Exception:
+            pass
+    return ""
+
+
+def probe(base, pw, sid, corpo):
+    """POST de corpo invalido -> 400 que diz a chave que falta. NAO cria mensagem."""
+    url = "%s/session/%s/prompt" % (base.rstrip("/"), sid)
+    req = urllib.request.Request(url, data=json.dumps(corpo).encode(), method="POST")
+    if pw:
+        req.add_header("Authorization", "Basic " + base64.b64encode(("opencode:" + pw).encode()).decode())
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, r.read().decode()[:200]
+    except urllib.error.HTTPError as e:
+        return e.code, (e.read() or b"").decode()[:200]
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, str(e)[:90])
+
+
+def interpreta(corpo):
+    try:
+        m = json.loads(corpo)
+    except Exception:
+        return "?", corpo[:80]
+    msg = (m.get("message") or "")
+    if "at [\"text\"]" in msg or "at [text]" in msg:
+        return '{"text":"..."}', "a API quer a chave 'text' -> formato ANTIGO"
+    if "at [\"prompt\"]" in msg or "at [prompt]" in msg:
+        return '{"prompt":{"text":"..."}}', "a API quer a chave 'prompt' -> formato NOVO"
+    if "Missing key" in msg:
+        return "?", msg.strip().split("\n")[0][:70]
+    return "?", msg[:70]
+
+
+def sessao_probe(base, pw):
+    """Cria uma sessao descartavel (para ter um id valido) e devolve o id."""
+    url = "%s/session" % base.rstrip("/")
+    req = urllib.request.Request(url, data=json.dumps({"title": "probe-contrato"}).encode(), method="POST")
+    if pw:
+        req.add_header("Authorization", "Basic " + base64.b64encode(("opencode:" + pw).encode()).decode())
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return (json.loads(r.read().decode()).get("data") or {}).get("id", "")
+    except Exception:
+        return ""
+
+
+def main():
+    out = {"celular": {}, "host": {}}
+    # 1) celular
+    pw = senha_local()
+    base = "http://127.0.0.1:%s/api" % os.environ.get("OC_PORT", "52031")
+    sid = sessao_probe(base, pw)
+    if sid:
+        st, corpo = probe(base, pw, sid, {})
+        payload, leitura = interpreta(corpo)
+        out["celular"] = {"base": base, "http": st, "payload_aceito": payload, "leitura": leitura}
+    else:
+        out["celular"] = {"erro": "nao criei a sessao de teste"}
+    # 2) host (leitura via ssh: a senha fica no host)
+    try:
+        cmd = ("python3 - <<'PY'\n"
+               "import json,os,base64,urllib.request,urllib.error\n"
+               "H=os.path.expanduser('~'); pw=''\n"
+               "try:\n"
+               "    for l in open(os.path.join(H,'.config/opencode/server.env')):\n"
+               "        if l.startswith('OPENCODE_SERVER_PASSWORD='): pw=l.split('=',1)[1].strip().strip(chr(34))\n"
+               "except Exception: pass\n"
+               "def H_(u):\n"
+               "    r=urllib.request.Request(u)\n"
+               "    if pw: r.add_header('Authorization','Basic '+base64.b64encode(('opencode:'+pw).encode()).decode())\n"
+               "    try:\n"
+               "        with urllib.request.urlopen(r,timeout=20) as x: return x.read().decode()\n"
+               "    except Exception as e: return ''\n"
+               "def P_(u,body):\n"
+               "    r=urllib.request.Request(u,data=body.encode(),method='POST')\n"
+               "    if pw: r.add_header('Authorization','Basic '+base64.b64encode(('opencode:'+pw).encode()).decode())\n"
+               "    r.add_header('Content-Type','application/json')\n"
+               "    try:\n"
+               "        with urllib.request.urlopen(r,timeout=20) as x: return x.status,x.read().decode()\n"
+               "    except urllib.error.HTTPError as e: return e.code,(e.read() or b'').decode()\n"
+               "    except Exception as e: return 0,str(e)\n"
+               "base='http://${TA_LINUX_IP4:-100.121.100.103}:4599/api'\n"
+               "sid=(json.loads(H_(base+'/session')) if False else '')\n"
+               "r=urllib.request.Request(base+'/session',data=json.dumps({'title':'probe-contrato'}).encode(),method='POST')\n"
+               "if pw: r.add_header('Authorization','Basic '+base64.b64encode(('opencode:'+pw).encode()).decode())\n"
+               "r.add_header('Content-Type','application/json')\n"
+               "try:\n"
+               "    sid=(json.loads(urllib.request.urlopen(r,timeout=20).read().decode()).get('data') or {}).get('id','')\n"
+               "except Exception: sid=''\n"
+               "st,c=P_(base+'/session/'+sid+'/prompt','{}')\n"
+               "print(json.dumps({'http':st,'corpo':c[:200]}))\n"
+               "PY")
+        p = subprocess.run(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                            "${TA_LINUX_USER:-nixos}@${TA_LINUX_IP4:-100.121.100.103}", cmd], capture_output=True, text=True, timeout=180)
+        linhas = [l for l in p.stdout.strip().split("\n") if l.strip().startswith("{")]
+        if linhas:
+            d = json.loads(linhas[-1])
+            payload, leitura = interpreta(d.get("corpo", ""))
+            out["host"] = {"base": "http://${TA_LINUX_IP4:-100.121.100.103}:4599/api", "http": d.get("http"),
+                           "payload_aceito": payload, "leitura": leitura}
+        else:
+            out["host"] = {"erro": (p.stderr or p.stdout or "sem saida")[:120]}
+    except Exception as e:
+        out["host"] = {"erro": str(e)[:100]}
+    if "--json" in sys.argv:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return 0
+    print("== CONTRATO DA API /prompt (probe sem escrever) ==")
+    for k in ("celular", "host"):
+        d = out.get(k) or {}
+        if d.get("erro"):
+            print("  %-8s ERRO: %s" % (k, d["erro"]))
+        else:
+            print("  %-8s HTTP %s | aceita: %-28s | %s" % (k, d.get("http"), d.get("payload_aceito"), d.get("leitura")))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

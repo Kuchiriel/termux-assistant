@@ -1,0 +1,310 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# wake-direct - entrega direta numa sessao de agente do host Linux, com modo adaptativo.
+#
+# POR QUE (medido em 08/11/2026): o coord_msg do coord-mcp entrega na sessao que o
+# registro de peers aponta — e esse registro estava com sessoes VELHAS (3 agentes na
+# mesma sessao de 4,9 dias). A API responde 204 ("agente vai rodar") mas a entrega nao
+# gera execucao. Entregar direto na sessao certa resolve.
+#
+# MODO ADAPTATIVO (o detalhe que faltava):
+#   - sessao OCUPADA (time.busy != 0) -> delivery:"queue" (a mensagem espera a vez;
+#     NAO interrompe o trabalho do agente)
+#   - sessao OCIOSA                   -> delivery:"steer" (entra na hora)
+#
+# O SEGREDO (senha do server) NUNCA sai do host: a entrega roda DENTRO do host,
+# lendo ~/.config/opencode/server.env la.
+#
+#   wake-direct <codinome> "<texto>"      # entrega e mostra o resultado
+#   wake-direct --status <codinome>       # so diagnostico (sessao + busy)
+#   wake-direct --since <epoch> <cod>     # 0 se a sessao avancou desde o epoch (RESPOSTA REAL)
+#   wake-direct --last <cod>              # epoch da ultima mensagem da sessao (atividade real)
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+
+# MEDIDO 14/11: a tailnet celular->PC ficou assimetrica, mas a LAN funciona.
+# Se HOST_IP foi sobrescrito explicitamente (teste), nao troca a rota.
+if [ -z "${HOST_IP+x}" ]; then
+  # MEDIDO 17/11: o IPv4 do tailnet (celular->PC) esta MORTO e a LAN tambem
+  # as vezes cai; o IPv6 [${TA_LINUX_HOST6:-fd7a:115c:a1e0::7f01:64bd}] responde. Tentar IPv4
+  # primeiro custava 10 s POR CHAMADA e matava o wake (6 agentes = 60 s).
+  HOST_IP="${WAKE_HOST_IP6:-${TA_LINUX_HOST6:-fd7a:115c:a1e0::7f01:64bd}}"
+  HOST_LAN_ENABLED="${WAKE_HOST_LAN:-0}"
+else
+  HOST_LAN_ENABLED="${WAKE_HOST_LAN:-0}"
+fi
+HOST_LAN_IP="${HOST_LAN_IP:-${TA_LINUX_LAN:-192.168.15.10}}"
+HOST_USER="${HOST_USER:-nixos}"
+HOST_TARGET="$HOST_IP"
+HOST_ROUTE="tailnet"
+if [ "$HOST_LAN_ENABLED" = "1" ] && timeout 2 bash -c "cat < /dev/null > /dev/tcp/$HOST_LAN_IP/22" 2>/dev/null; then
+  HOST_TARGET="$HOST_LAN_IP"
+  HOST_ROUTE="LAN"
+fi
+MODE="deliver"
+
+case "${1:-}" in
+  --status) MODE="status"; shift ;;
+  --since) MODE="since"; SINCE="${2:-0}"; shift 2 ;;
+  --last) MODE="last"; shift ;;
+  -h|--help) cat <<'USO'
+uso:
+  wake-direct <codinome> "<texto>"      # entrega e mostra o resultado
+  wake-direct --status <codinome>       # so diagnostico (sessao + busy)
+  wake-direct --since <epoch> <cod>     # 0 se a sessao avancou desde o epoch (RESPOSTA REAL)
+  wake-direct --last <cod>              # epoch da ultima mensagem da sessao (atividade real)
+
+ATENCAO (medido 12/11): as opcoes vem ANTES do codinome. Escrever
+'--since <epoch>' DEPOIS do codinome faz o script entregar uma mensagem de
+verdade (um wake) em vez de medir — foi o que aconteceu comigo.
+USO
+  exit 0 ;;
+esac
+SINCE="${SINCE:-0}"
+COD="${1:-}"
+TEXTO="${2:-}"
+[ -z "$COD" ] && { echo "uso: wake-direct <codinome> \"<texto>\"" >&2; exit 2; }
+
+# ---- script remoto (executa no host; a senha fica la) ----
+cat > "$PREFIX/tmp/opencode/wake-direct-remote.sh" <<'REMOTE'
+set -uo pipefail
+COD="$1"; NOME="$2"; TEXTO="$3"; MODO="$4"
+OC_URL="${AGENTS_OC_URL:-http://${TA_LINUX_IP4:-100.121.100.103}:4599/api}"
+OC_USER="${OPENCODE_SERVER_USERNAME:-opencode}"
+ENVFILE="$HOME/.config/opencode/server.env"
+OC_PASS="${OPENCODE_SERVER_PASSWORD:-}"
+if [ -z "$OC_PASS" ] && [ -r "$ENVFILE" ]; then
+  OC_PASS=$(sed -n 's/^OPENCODE_SERVER_PASSWORD=//p' "$ENVFILE" | head -1)
+  OC_PASS="${OC_PASS%\"}"; OC_PASS="${OC_PASS#\"}"
+fi
+ROSTER="$HOME/projects/.agents/roster.json"
+[ -r "$ROSTER" ] || ROSTER="$HOME/.agents/roster.json"
+# MEDIDO 10/11: o script remoto rodava 3 python3 SEPARADOS so para o roster
+# (SID, SHARED, LANE). Com o host saturado, cada inicializacao de python custa
+# segundos -> o wake pagava 3x a latencia. Agora e' UM python so.
+_roster_out=$(python3 - "$ROSTER" "$COD" "$NOME" <<'PYROSTER'
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: print("\t\t\t"); raise SystemExit
+itens=d if isinstance(d,list) else (d.get("agents") or d.get("roster") or [])
+alvos=[a.lower() for a in sys.argv[2:4] if a]
+sess=""; lane=""
+for it in itens:
+    if not isinstance(it,dict): continue
+    # MEDIDO 10/11: o roster do host usa o campo 'codename' (SEM o 'i') e tem
+    # 'aliases' (lista). O matcher procurava so 'codinome' -> o alias
+    # Arara -> jarvis@nitro-v15 nao casava e o wake falhava com 'sem sessao'.
+    nomes=[str(it.get("name") or "").lower(),
+           str(it.get("codename") or "").lower(),
+           str(it.get("codinome") or "").lower(),
+           str(it.get("id") or "").lower()]
+    nomes += [str(a).lower() for a in (it.get("aliases") or [])]
+    if any(n and n in alvos for n in nomes):
+        sess=it.get("session") or it.get("sessionID") or ""
+        lane=it.get("lane") or ""
+        break
+if not sess: print("\t\t\t"); raise SystemExit
+n=sum(1 for it in itens if isinstance(it,dict) and (it.get("session") or it.get("sessionID") or "")==sess)
+print("%s\t%s\t%s" % (sess, "1" if n>1 else "0", lane))
+PYROSTER
+)
+SID=$(printf '%s' "$_roster_out" | cut -f1)
+SHARED=$(printf '%s' "$_roster_out" | cut -f2)
+LANE=$(printf '%s' "$_roster_out" | cut -f3)
+if [ -z "$SID" ]; then echo "ERRO sem sessao no roster para '$COD'"; exit 3; fi
+
+# MEDIDO 10/11: as consultas a API (busy/last) tambem eram 2 python3 separados;
+# agora e' UM com modo, e so roda quando o modo precisa.
+api_info() {
+python3 - "$OC_URL" "$OC_USER" "$OC_PASS" "$SID" "$1" <<'PYAPI'
+import base64,json,sys,urllib.request
+base,user,pw,sid,modo=sys.argv[1:6]
+h={"Authorization":"Basic "+base64.b64encode(f"{user}:{pw}".encode()).decode()}
+def get(url,to):
+    try:
+        req=urllib.request.Request(url,headers=h)
+        with urllib.request.urlopen(req,timeout=to) as r:
+            return json.loads(r.read() or b"{}")
+    except Exception:
+        return None
+if modo=="busy":
+    # (17/11) CORRECAO: time.busy e' um TIMESTAMP (ou ausente), nao um booleano.
+    # Comparar com 0 fazia TODO agente parecer ocupado -> delivery=queue sempre,
+    # mesmo ocioso (medido no hub: busy=False para os 6). A fonte real e'
+    # time.updated vs agora, a mesma janela de 90 s do agent-hub.mjs.
+    import time as _t
+    d=get(f"{base}/session/{sid}",15)
+    if d is None:
+        print(-1); raise SystemExit
+    s=d.get("data") or d
+    tm=s.get("time") or {}
+    upd=tm.get("updated") or 0
+    print(1 if upd and (_t.time()*1000 - upd) < 90000 else 0); raise SystemExit
+out=0
+d=get(f"{base}/session/{sid}",20)
+if d is not None:
+    s=d.get("data") or d
+    out=int(((s.get("time") or {}).get("updated") or 0)//1000)
+if not out:
+    d=get(f"{base}/session/{sid}/message?limit=200",25)
+    if d is not None:
+        msgs=(d.get("data") or [])
+        out=max([m.get("time",{}).get("created",0) for m in msgs] or [0])//1000
+print(out)
+PYAPI
+}
+
+if [ "$MODO" = "status" ]; then
+  BUSY=$(api_info busy)
+  echo "sessao=$SID busy=$BUSY"
+  exit 0
+fi
+if [ "$MODO" = "last" ]; then
+  # FONTE PRIMARIA: GET /session -> time.updated. Fallback: ultima mensagem.
+  LAST=$(api_info last)
+  echo "$LAST"
+  exit 0
+fi
+if [ "$MODO" = "since" ]; then
+  # a sessao avancou desde o epoch? (a resposta real de um agente e' a sessao TRABALHAR)
+  LAST=$(api_info last)
+  SINCE_S="${5:-0}"
+  if [ "${LAST:-0}" -gt "${SINCE_S:-0}" ]; then echo "TRABALHOU sessao=$SID last=$LAST"; exit 0
+  else echo "SEM_MUDANCA sessao=$SID last=$LAST"; exit 1; fi
+fi
+BUSY=$(api_info busy)
+DELIVERY="queue"
+[ "$BUSY" = "0" ] && DELIVERY="steer"
+# (17/11) O proprio POST do wake atualiza time.updated: depois de entregar,
+# a sessao aparece "busy" e o proximo wake cai em queue para sempre. Quando o
+# dono (ou um teste de frota) precisa de entrega sincrona, WAKE_FORCE_STEER=1
+# quebra o ciclo. Uso: WAKE_FORCE_STEER=1 wake-direct <cod> "<texto>"
+[ "${WAKE_FORCE_STEER:-0}" = "1" ] && DELIVERY="steer"
+if [ "$SHARED" = "1" ]; then
+  # sessao compartilhada: o wake precisa saber pra QUEM e (o agente presente na
+  # sessao pode nao ser o destinatario) -> @codinome na 1a linha + registro no bus
+  TEXTO="@$COD $TEXTO"
+  ( cd "$HOME/projects/nixos-ai" 2>/dev/null && node tools/coord.mjs post --kind msg \
+      --agent "$COD" --lane "${LANE:-coord}" --note "$TEXTO" >/dev/null 2>&1 ) || true
+fi
+python3 - "$OC_URL" "$OC_USER" "$OC_PASS" "$SID" "$TEXTO" "$DELIVERY" <<'PY'
+import base64,json,sys,urllib.request,urllib.error
+base,user,pw,sid,texto,delivery=sys.argv[1:7]
+# CONTRATO DA API (medido 09/11/2026 no celular 2.2.5 E no host 2.2.6):
+#   POST /api/session/<id>/prompt aceita {"text":"..."} (+ "delivery":"queue"|"steer") -> HTTP 200
+#   O formato {"prompt":{"text":...}} devolve HTTP 400 "Missing key at [text]" -> NAO funciona.
+#   (a licao antiga da malha dizia o CONTRARIO — estava INVERTIDA e quebrava o wake da frota:
+#    o 400 "Missing key" que eu vi ao acordar o Falcao era exatamente isso.)
+def envia(payload):
+    body=json.dumps(payload)
+    req=urllib.request.Request(f"{base}/session/{sid}/prompt",data=body.encode(),method="POST",
+      headers={"Content-Type":"application/json","Authorization":"Basic "+base64.b64encode(f"{user}:{pw}".encode()).decode()})
+    try:
+        with urllib.request.urlopen(req,timeout=25) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, (e.read() or b"").decode("utf-8","replace")
+st, resp = envia({"text":texto,"delivery":delivery})
+if st == 400 and "text" in resp:
+    st, resp = envia({"prompt":{"text":texto},"delivery":delivery})   # fallback p/ versao futura
+if st and 200 <= st < 300:
+    # (17/11) O POST admitiu o item no INBOX mas gravou delivery=QUEUE: a
+    # sessao fica "running" e NAO executa. A API V2 manda promover com PATCH
+    # steer ("Steering wakes session execution"). Sem isto, HTTP 200 e' so
+    # admissao — o bug que parou a delegacao da frota hoje.
+    steer = "-"
+    try:
+        rid = (json.loads(resp).get("data") or {}).get("id")
+        if rid:
+            hdr = {"Content-Type":"application/json",
+                   "Authorization":"Basic "+base64.b64encode(f"{user}:{pw}".encode()).decode()}
+            preq = urllib.request.Request(
+                f"{base}/api/session/{sid}/inbox/{rid}",
+                data=json.dumps({"delivery":"steer"}).encode(),
+                method="PATCH", headers=hdr)
+            with urllib.request.urlopen(preq, timeout=15) as pr:
+                steer = str(pr.status)
+    except Exception:
+        steer = "erro"
+    print(f"HTTP {st} sessao={sid} delivery={delivery} steer_patch={steer}")
+else:
+    print(f"ERRO HTTP {st} sessao={sid} delivery={delivery}: {resp[:120]}")
+    # MEDIDO 09/11: sem este sys.exit(1) o script saia com 0 MESMO no HTTP 400,
+    # e o heartbeat (que decide 'acordei' pelo exit code) contava a entrega
+    # FALHADA como sucesso — foi assim que o canal de wake ficou quebrado por
+    # horas com a 'taxa de entrega' em 100%. Agora falha = exit != 0.
+    sys.exit(1)
+PY
+REMOTE
+
+# o roster.json do host usa o NOME do agente (jarvis@nitro-v15); o coord-mcp usa o
+# CODINOME (Arara). Resolve os dois e passa os dois.
+# MEDIDO 10/11: o 'coord-cli roster' fala com o coord-mcp pela rota /mcp, que ficou
+# PENDURADA no host (medido do celular: /mcp nao responde em 15 s, enquanto / e
+# /health respondem em 0,2-1,1 s e a carga do host esta normal). Como o wake
+# dependia dessa chamada, o wake INTEIRO estourava — o canal de wake ficava morto
+# sem que o host estivesse realmente fora. Agora:
+#   caminho comum = 1 SSH (o script remoto ja casa por 'name' OU 'codinome');
+#   2a via (so se a 1a falhar) = resolver o alias por SSH; o coord-cli fica como
+#   ultima reserva.
+_roster_py='
+import json,os,sys
+cod=(sys.argv[1] if len(sys.argv)>1 else "").lower()
+try:
+    d=json.load(open(os.path.expanduser("~/projects/.agents/roster.json")))
+except Exception:
+    print(""); raise SystemExit
+itens=d if isinstance(d,list) else (d.get("agents") or d.get("roster") or [])
+for i in itens:
+    if not isinstance(i,dict): continue
+    nomes=[str(i.get("name") or "").lower(),
+           str(i.get("codename") or "").lower(),
+           str(i.get("codinome") or "").lower(),
+           str(i.get("id") or "").lower()]
+    nomes += [str(a).lower() for a in (i.get("aliases") or [])]
+    if cod and cod in nomes:
+        print(i.get("name") or i.get("codename") or i.get("codinome") or ""); break
+'
+# O NOME (alias codinome->name) so e' preciso se o roster do host nao trouxer o
+# proprio codinome. Como o script remoto ja casa por 'name' OU 'codinome', esse
+# lookup so roda como SEGUNDA VIA, quando a 1a entrega falhar.
+NOME=""
+TXT_SAFE=$(printf '%s' "$TEXTO" | tr '\n' ' ')
+_out=$(timeout 90 ssh -6 -o BatchMode=yes -o ConnectTimeout=10 "$HOST_USER@$HOST_TARGET" \
+  "WAKE_FORCE_STEER=${WAKE_FORCE_STEER:-0} bash -s -- '$COD' \"$NOME\" \"$TXT_SAFE\" '$MODE' '${SINCE:-0}'" \
+  < "$PREFIX/tmp/opencode/wake-direct-remote.sh" 2>&1)
+_rc=$?
+printf '%s\n' "$_out" | tail -3
+
+# Se a LAN estava noTCP mas o SSH falhou, tenta a tailnet uma vez.
+if [ "$_rc" -ne 0 ] && [ "$HOST_ROUTE" = "LAN" ]; then
+  _out_tail=$(timeout 90 ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST_USER@$HOST_IP" \
+    "WAKE_FORCE_STEER=${WAKE_FORCE_STEER:-0} bash -s -- '$COD' \"$NOME\" \"$TXT_SAFE\" '$MODE' '${SINCE:-0}'" \
+    < "$PREFIX/tmp/opencode/wake-direct-remote.sh" 2>&1)
+  _rc_tail=$?
+  if [ "$_rc_tail" -eq 0 ]; then
+    _out="$_out_tail"
+    _rc=0
+    HOST_ROUTE="tailnet"
+    printf '%s\n' "$_out" | tail -3
+  fi
+fi
+
+# 2a via: se o roster do host nao tinha o codinome, resolve o alias e tenta de novo
+case "$_out" in
+  *"sem sessao no roster"*)
+    _alias=$(timeout 25 ssh -6 -o BatchMode=yes -o ConnectTimeout=10 "$HOST_USER@$HOST_TARGET" \
+      "python3 -c '$_roster_py' '$COD'" 2>/dev/null | tr -d '\r')
+    if [ -z "$_alias" ] && command -v coord-cli >/dev/null 2>&1; then
+      _alias=$(timeout 20 coord-cli roster 2>/dev/null | sed -n "s/^- $COD · *\([^·]*\)·.*/\1/p" | head -1 | tr -d ' ')
+    fi
+    if [ -n "$_alias" ] && [ "$_alias" != "$NOME" ]; then
+      _out2=$(timeout 90 ssh -6 -o BatchMode=yes -o ConnectTimeout=10 "$HOST_USER@$HOST_TARGET" \
+        "WAKE_FORCE_STEER=${WAKE_FORCE_STEER:-0} bash -s -- '$COD' \"$_alias\" \"$TXT_SAFE\" '$MODE' '${SINCE:-0}'" \
+        < "$PREFIX/tmp/opencode/wake-direct-remote.sh" 2>&1)
+      _rc2=$?
+      printf '%s\n' "$_out2" | tail -3
+      exit "$_rc2"
+    fi
+    ;;
+esac
+exit "$_rc"

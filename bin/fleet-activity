@@ -1,0 +1,108 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# fleet-activity - atividade de TODOS os agentes da frota em 1 unico round-trip.
+#
+# Antes: cada agente exigia 1 SSH (wake-direct --last/--status) -> 5-10 SSH por
+# ciclo do heartbeat. Agora: 1 SSH so, que traz roster + sessao + updated + busy
+# de cada agente (o Python roda DENTRO do host, com a senha do server la).
+#
+#   fleet-activity            # JSON compacto
+#   fleet-activity --quiet    # so um resumo por linha
+#   fleet-activity --json     # identico ao padrao
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+
+HOST_IP="${HOST_IP:-${TA_LINUX_IP4:-100.121.100.103}}"
+HOST_USER="${HOST_USER:-nixos}"
+
+cat > "$PREFIX/tmp/opencode/fleet-activity-remote.sh" <<'REMOTE'
+set -uo pipefail
+OC_URL="${AGENTS_OC_URL:-http://${TA_LINUX_IP4:-100.121.100.103}:4599/api}"
+OC_USER="${OPENCODE_SERVER_USERNAME:-opencode}"
+ENVFILE="$HOME/.config/opencode/server.env"
+OC_PASS="${OPENCODE_SERVER_PASSWORD:-}"
+if [ -z "$OC_PASS" ] && [ -r "$ENVFILE" ]; then
+  OC_PASS=$(sed -n 's/^OPENCODE_SERVER_PASSWORD=//p' "$ENVFILE" | head -1)
+  OC_PASS="${OC_PASS%\"}"; OC_PASS="${OC_PASS#\"}"
+fi
+ROSTER="$HOME/projects/.agents/roster.json"
+[ -r "$ROSTER" ] || ROSTER="$HOME/.agents/roster.json"
+python3 - "$OC_URL" "$OC_USER" "$OC_PASS" "$ROSTER" <<'PYEOF'
+import base64, json, sys, urllib.request, urllib.error, time
+
+base, user, pw, roster_path = sys.argv[1:5]
+h = {"Authorization": "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()}
+
+
+def get(path):
+    try:
+        req = urllib.request.Request(f"{base}{path}", headers=h)
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return json.loads(r.read() or b"{}")
+    except Exception:
+        return None
+
+
+try:
+    d = json.load(open(roster_path))
+except Exception:
+    d = {}
+itens = d if isinstance(d, list) else (d.get("agents") or d.get("roster") or [])
+
+# 1 sessao por agente (1 request) + cache dos dados de sessao ja vistos
+sessoes = {}
+for it in itens:
+    if not isinstance(it, dict):
+        continue
+    nome = it.get("name") or it.get("codinome") or ""
+    sid = it.get("session") or it.get("sessionID") or ""
+    if not nome:
+        continue
+    if sid and sid not in sessoes:
+        s = get(f"/session/{sid}")
+        info = (s.get("data") or s) if isinstance(s, dict) else {}
+        t = info.get("time") or {}
+        sessoes[sid] = {
+            "updated": int(t.get("updated") or 0) // 1000,
+            "busy": int(t.get("busy") or 0),
+            "title": (info.get("title") or "")[:48],
+        }
+    s = sessoes.get(sid, {})
+    sessoes.setdefault(sid, {"updated": 0, "busy": 0, "title": ""})
+
+agentes = {}
+contagem = {}
+for it in itens:
+    if not isinstance(it, dict):
+        continue
+    nome = it.get("name") or it.get("codinome") or ""
+    if not nome:
+        continue
+    sid = it.get("session") or it.get("sessionID") or ""
+    contagem[sid] = contagem.get(sid, 0) + 1
+for it in itens:
+    if not isinstance(it, dict):
+        continue
+    nome = it.get("name") or it.get("codinome") or ""
+    if not nome:
+        continue
+    sid = it.get("session") or it.get("sessionID") or ""
+    info = sessoes.get(sid, {})
+    agentes[nome] = {
+        "sessao": sid,
+        "lane": it.get("lane") or "",
+        "updated": info.get("updated", 0),
+        "busy": info.get("busy", 0),
+        "compartilhada": contagem.get(sid, 0) > 1,
+        "compartilhada_com": [],
+        "titulo": info.get("title", ""),
+    }
+for nome, a in agentes.items():
+    a["compartilhada_com"] = [n for n, b in agentes.items()
+                              if n != nome and b["sessao"] and b["sessao"] == a["sessao"]]
+now = int(time.time())
+print(json.dumps({"ts": now, "agentes": agentes}, ensure_ascii=False))
+PYEOF
+REMOTE
+
+timeout 90 ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST_USER@$HOST_IP" 'bash -s' \
+  < "$PREFIX/tmp/opencode/fleet-activity-remote.sh" 2>/dev/null | tail -1

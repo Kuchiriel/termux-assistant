@@ -1,0 +1,1164 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""phone-fs — interface segura para OUTROS agentes organizarem os arquivos do celular.
+
+Por que existe: o Linux (nitrov15) e o Windows precisam organizar a vida do dono
+(fotos, PDFs, musicas, Downloads) que estao no celular. Antes they'd fazer isso
+SSHando direto e mexendo no storage — sem regra, sem rastro. Este tool da:
+
+  1. INVENTARIO  — o que tem, onde, tamanho, tipo, data (JSON pra agente consumir)
+  2. BUSCA       — por nome/extensao/data
+  3. LEITURA     — texto (com limite); binarios ficam de fora
+  4. PROPOSTA   — o agente externo DESCREVE o que quer mover; o celular executa
+                   (sempre via QUARENTENA + manifesto; NUNCA delete direto)
+
+SEGURANCA (rules do dono):
+  - leitura e allowlist de raizes; fora delas -> negado
+  - NUNCA ler/escrever: WhatsApp Databases/backups, DCIM, Documents, Pictures,
+    Music, Movies (pessoais, intocaveis), .ssh, keystore
+  - NENHUMA operacao destrutiva: mover vai para QUARENTENA (SSD), com manifesto
+    reversivel. Delete puro nao existe neste tool.
+  - toda chamada e auditada em ~/.local/state/phone-fs.log
+
+USO (a partir do Linux, via SSH):
+    ssh -p 8022 u0_a438@${TA_PHONE_IP:-100.104.175.123} '~/bin/phone-fs inventory --json'
+    ssh -p 8022 u0_a438@${TA_PHONE_IP:-100.104.175.123} '~/bin/phone-fs find factura --type pdf'
+    ssh -p 8022 u0_a438@${TA_PHONE_IP:-100.104.175.123} '~/bin/phone-fs propose move --match "*.pdf" --to /storage/6E7C-8AB3/Documents'
+    ssh -p 8022 u0_a438@${TA_PHONE_IP:-100.104.175.123} '~/bin/phone-fs plans'
+    ssh -p 8022 u0_a438@${TA_PHONE_IP:-100.104.175.123} '~/bin/phone-fs apply <plan_id>'
+
+Subcomandos:
+    inventory [--json] [--root R] [--top N]
+    find <termo> [--root R] [--type ext] [--since YYYY-MM-DD] [--max N] [--json]
+                 [--path] [--dir SUBPASTA]
+    stat <caminho>
+    cat <caminho> [--max BYTES]
+    propose <move|quarantine> --match GLOB [--to DIR] [--root R] [--note TEXTO]
+    propose moves --from-list ARQ.json      # mapa explicito {de,para} (taxonomia)
+    plans [--json]
+    apply <plan_id> [--yes] [--dry-run]
+    catalog [--json] [--out ARQ] [--compare ARQ] [--full] [--include-personal]
+    sensitive [--json]              # itens de risco no storage (so metadados)
+    roots
+    health
+"""
+import argparse
+import datetime
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+LOG = os.path.join(HOME, ".local/state/phone-fs.log")
+PLANS = os.path.join(HOME, "docs/planos")
+SSD = "/storage/6E7C-8AB3"
+
+# Raizes legiveis (allowlist). O resto do aparelho e NEGADO.
+READ_ROOTS = [
+    os.path.join(HOME, "storage/shared"),
+    os.path.join(HOME, "media"),
+    os.path.join(HOME, "docs"),
+    os.path.join(HOME, "archive"),
+    os.path.join(HOME, "projects"),
+    SSD,
+]
+
+# NUNCA tocados (pessoais/sensíveis) — nem para leitura automatica.
+DENY_PARTS = [
+    "/.ssh", "/.gnupg", "/keystore", "/Android/data", "/Android/obb",
+    "/WhatsApp", "/Databases", "/databases", "/com.whatsapp",
+    "/Backups", "/backups", "/.nomedia",
+]
+# Pastas que existem mas o dono mandou nunca mexer.
+DENY_EXACT = {"DCIM", "Documents", "Pictures", "Music", "Movies"}
+# ... mas o INVENTARIO pode olhar (so metadados) para reportar. Mutacao NUNCA.
+MUTATION_DENY = set(DENY_EXACT) | {"Android"}
+
+# Diretorios que o walk NUNCA desce (nem para contar) — politica do dono.
+SKIP_DIR_PARTS = ["com.whatsapp", "databases", "backups", "keystore", ".ssh", ".gnupg"]
+
+MAX_READ = 2 * 1024 * 1024      # 2 MB por leitura de texto
+DEFAULT_MAX_FIND = 200
+
+CATALOG_DIR = os.path.join(HOME, "docs/catalogo")
+
+
+def safe_rel(path, root):
+    """Caminho relativo de `path` dentro de `root` (pra montar destino espelhado)."""
+    try:
+        return os.path.relpath(path, root)
+    except ValueError:
+        return os.path.basename(path)
+
+
+def in_allowlist(path):
+    """True se o caminho (realpath) esta dentro de alguma raiz permitida."""
+    real = os.path.realpath(path)
+    for r in READ_ROOTS:
+        rr = os.path.realpath(r)
+        if real == rr or real.startswith(rr.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def check_move(src, dst):
+    """Valida um movimento. Devolve (ok, motivo). NUNCA permite tocar intocavel."""
+    for p in (src, dst):
+        low = os.path.realpath(p).lower()
+        if any(part.lower() in low for part in DENY_PARTS):
+            return False, "caminho sensivel (negado)"
+    if not in_allowlist(src):
+        return False, "origem fora das raizes permitidas"
+    if not in_allowlist(dst):
+        return False, "destino fora das raizes permitidas"
+    if is_personal_dir(src):
+        return False, "origem em pasta pessoal intocavel"
+    if is_personal_dir(dst):
+        return False, "destino em pasta pessoal intocavel"
+    if not os.path.exists(src):
+        return False, "origem nao existe"
+    if os.path.exists(dst):
+        return False, "destino ja existe"
+    return True, ""
+
+
+
+def caller_id():
+    """Quem chamou: IP do cliente SSH (SSH_CLIENT) ou 'local' se rodou no celular.
+
+    Sem isso o log de auditoria nao respondia 'quem acessou os arquivos do dono
+    e de onde' — que e a promessa central do tool.
+    """
+    sc = os.environ.get("SSH_CLIENT", "").strip()
+    if sc:
+        partes = sc.split()
+        ip = partes[0] if partes else "?"
+        porta = partes[1] if len(partes) > 1 else "?"
+        return "ssh:%s:%s" % (ip, porta)
+    conn = os.environ.get("SSH_CONNECTION", "").strip()
+    if conn:
+        return "ssh:%s" % conn.split()[0]
+    return "local"
+
+
+def log_call(tool, args, outcome="ok", extra=""):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write(
+                "%s caller=%s tool=%s args=%s outcome=%s %s\n"
+                % (datetime.datetime.now(datetime.timezone.utc).isoformat(), caller_id(), tool,
+                   " ".join(args)[:300], outcome, extra)
+            )
+    except Exception:
+        pass
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def resolve(p):
+    """Resolve um caminho; devolve (abs, dentro_de_allowlist, Motivo).
+
+    ~/storage/shared e symlink para /storage/emulated/0 -> comparamos sempre
+    com os roots em realpath, senao tudo em /storage/emulated/0 seria negado.
+    """
+    if not p:
+        return None, False, "caminho vazio"
+    abs_p = os.path.abspath(os.path.expanduser(p))
+    real = os.path.realpath(abs_p)
+    if any(part.lower() in real.lower() for part in DENY_PARTS):
+        return real, False, "caminho sensivel (negado)"
+    real_roots = [os.path.realpath(r) for r in READ_ROOTS]
+    ok = any(real == r or real.startswith(r.rstrip("/") + "/") for r in real_roots)
+    return real, ok, "" if ok else "fora das raizes permitidas"
+
+
+def is_personal_dir(path):
+    """True se o caminho estiver numa pasta pessoal (proibida para mutacao)."""
+    parts = set(path.split("/"))
+    return bool(parts & MUTATION_DENY)
+
+
+def du(path):
+    out = subprocess.run(["du", "-sk", path], capture_output=True, text=True, timeout=60)
+    try:
+        return int(out.stdout.split()[0])
+    except Exception:
+        return 0
+
+
+def file_type(name):
+    ext = os.path.splitext(name)[1].lower().lstrip(".")
+    if not ext:
+        return "sem-ext"
+    buckets = {
+        "pdf": "documento", "doc": "documento", "docx": "documento", "odt": "documento",
+        "txt": "documento", "md": "documento", "rtf": "documento", "epub": "documento",
+        "jpg": "imagem", "jpeg": "imagem", "png": "imagem", "gif": "imagem", "webp": "imagem",
+        "heic": "imagem", "dng": "imagem", "raw": "imagem",
+        "mp4": "video", "mkv": "video", "mov": "video", "avi": "video", "webm": "video",
+        "mp3": "audio", "m4a": "audio", "wav": "audio", "flac": "audio", "opus": "audio", "ogg": "audio",
+        "zip": "pacote", "rar": "pacote", "7z": "pacote", "tar": "pacote", "gz": "pacote",
+        "apk": "pacote", "exe": "pacote", "iso": "pacote",
+        "xlsx": "planilha", "csv": "planilha", "ods": "planilha",
+    }
+    return buckets.get(ext, ext or "sem-ext")
+
+
+def walk(root, limit=None):
+    """Lista arquivos (sem seguir symlink para fora; nunca entra em pasta proibida)."""
+    n = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        # nao descer em Android/data|obb, pastas ocultas nem bancos/backups do WhatsApp
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in ("data", "obb")
+            and not d.startswith(".")
+            and not any(s.lower() in d.lower() for s in SKIP_DIR_PARTS)
+        ]
+        for fn in filenames:
+            full = os.path.join(dirpath, fn)
+            low = full.lower()
+            if any(s.lower() in low for s in SKIP_DIR_PARTS):
+                continue
+            try:
+                st = os.stat(full)
+            except Exception:
+                continue
+            yield {
+                "path": full,
+                "name": fn,
+                "size": st.st_size,
+                "mtime": datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d"),
+                "type": file_type(fn),
+            }
+            n += 1
+            if limit and n >= limit:
+                return
+
+
+def cmd_inventory(a):
+    roots = READ_ROOTS
+    if a.root:
+        roots = [r for r in READ_ROOTS if a.root in r]
+    out = {"ts": now_iso(), "host": "termux", "roots": []}
+    for r in roots:
+        if not os.path.isdir(r):
+            continue
+        files = list(walk(r))
+        by_type = {}
+        by_year = {}
+        for f in files:
+            by_type[f["type"]] = by_type.get(f["type"], 0) + 1
+            by_year[f["mtime"][:4]] = by_year.get(f["mtime"][:4], 0) + 1
+        top = sorted(files, key=lambda x: -x["size"])[: a.top]
+        out["roots"].append({
+            "root": r,
+            "label": os.path.basename(r) or r,
+            "arquivos": len(files),
+            "bytes": sum(f["size"] for f in files),
+            "por_tipo": dict(sorted(by_type.items(), key=lambda kv: -kv[1])[:12]),
+            "por_ano": dict(sorted(by_year.items(), reverse=True)[:6]),
+            "maiores": [{"name": t["name"], "path": t["path"], "size": t["size"], "type": t["type"]} for t in top],
+            "pastas_pessoais_intocaveis": sorted(
+                d for d in os.listdir(r) if d in DENY_EXACT
+            ),
+        })
+    out["total_arquivos"] = sum(r["arquivos"] for r in out["roots"])
+    out["total_bytes"] = sum(r["bytes"] for r in out["roots"])
+    out["regras"] = {
+        "leitura": "allowlist de raizes",
+        "mutacao": "via propose/apply -> QUARENTENA + manifesto (nunca delete)",
+        "intocaveis": sorted(MUTATION_DENY),
+        "ssd_quarentena": SSD + "/quarentena-termux",
+    }
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+    else:
+        print("INVENTARIO do celular (%s) — %s arquivos, %s" % (
+            now_iso(), out["total_arquivos"], human(out["total_bytes"])))
+        for r in out["roots"]:
+            print("\n== %s  (%s arquivos, %s)" % (r["label"], r["arquivos"], human(r["bytes"])))
+            print("   tipos:", ", ".join("%s=%s" % (k, v) for k, v in list(r["por_tipo"].items())[:8]))
+            for t in r["maiores"][:5]:
+                print("   grande: %-42s %8s  %s" % (t["name"][:42], human(t["size"]), t["type"]))
+    return 0
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}PB"
+
+
+def cmd_find(a):
+    roots = [r for r in READ_ROOTS if (not a.root or a.root in r)]
+    term = a.term.lower()
+    since = None
+    if a.since:
+        since = datetime.datetime.strptime(a.since, "%Y-%m-%d").date()
+    dir_filt = (a.dir or "").lower()
+    # MEDIDO 09/11: o PADRAO era casar o termo SO no nome do arquivo -> o pedido
+    # mais comum do dono ('acha o documento do INSS') dava 0 hits, porque os
+    # documentos dele estao em PASTA tematica (Download/INSS-28-09/...). Com o
+    # caminho no padrao, INSS foi de 0 -> 15. O modo antigo continua em
+    # --so-nome. (O caminho termina no nome, entao '--path' ja casa os dois.)
+    casa_no_caminho = a.path or not a.so_nome
+    hits = []
+    for r in roots:
+        for f in walk(r):
+            # casa no CAMINHO (o dono organiza por PASTA tematica:
+            # 'Download/INSS-28-09/...'). --so-nome: so o nome do arquivo.
+            # --dir: so o que esta dentro da pasta.
+            if casa_no_caminho:
+                if term not in f["path"].lower():
+                    continue
+            else:
+                if term not in f["name"].lower():
+                    continue
+            if dir_filt and dir_filt not in f["path"].lower():
+                continue
+            if a.type and f["type"] != a.type and not f["name"].lower().endswith("." + a.type.lower()):
+                continue
+            if since:
+                try:
+                    if datetime.datetime.strptime(f["mtime"], "%Y-%m-%d").date() < since:
+                        continue
+                except Exception:
+                    pass
+            hits.append(f)
+            if len(hits) >= a.max:
+                break
+        if len(hits) >= a.max:
+            break
+    if a.json:
+        print(json.dumps({"ts": now_iso(), "term": a.term,
+                          "match": "path" if casa_no_caminho else "nome",
+                          "dir": a.dir or "", "n": len(hits), "hits": hits},
+                         ensure_ascii=False, indent=1))
+    else:
+        print(f"{len(hits)} resultado(s) para '{a.term}':")
+        for f in hits[: a.max]:
+            print("  %-10s %10s  %s  %s" % (f["type"], human(f["size"]), f["mtime"], f["path"]))
+    return 0
+
+
+def cmd_stat(a):
+    real, ok, why = resolve(a.path)
+    if not ok:
+        log_call("stat", a.path, "denied", why)
+        print("NEGADO:", why, file=sys.stderr)
+        return 2
+    if not os.path.exists(real):
+        print("nao existe", file=sys.stderr)
+        return 1
+    st = os.stat(real)
+    print(json.dumps({
+        "path": real, "size": st.st_size, "type": file_type(real),
+        "mtime": datetime.datetime.fromtimestamp(st.st_mtime).isoformat(),
+        "dir": os.path.isdir(real), "intocavel": is_personal_dir(real),
+    }, ensure_ascii=False, indent=1))
+    return 0
+
+
+def cmd_cat(a):
+    real, ok, why = resolve(a.path)
+    if not ok:
+        log_call("cat", a.path, "denied", why)
+        print("NEGADO:", why, file=sys.stderr)
+        return 2
+    if os.path.isdir(real):
+        print("é diretório; use find/inventory", file=sys.stderr)
+        return 1
+    size = os.path.getsize(real)
+    if size > MAX_READ:
+        print(f"arquivo grande demais ({human(size)}); leia com head/sed via SSH", file=sys.stderr)
+        return 1
+    try:
+        data = open(real, "rb").read()
+    except Exception as e:
+        print("erro:", e, file=sys.stderr)
+        return 1
+    if b"\x00" in data[:2048]:
+        print("binário; use 'cp' via SSH se precisar", file=sys.stderr)
+        return 1
+    sys.stdout.write(data[: a.max].decode("utf-8", "replace"))
+    return 0
+
+
+def match_name(name, pat):
+    """Casamento tolerante: glob exato, glob envelope, ou substring (sem metacaractere)."""
+    if not pat:
+        return False
+    low_n, low_p = name.lower(), pat.lower()
+    if fnmatch.fnmatch(low_n, low_p):
+        return True
+    if any(c in pat for c in "*?["):
+        # envelope: *.FGC9 -> *FGC9*
+        core = pat.strip("*").lstrip(".")
+        if core and core.lower() in low_n:
+            return True
+        return False
+    return low_p in low_n
+
+
+def match_path(path, root, pat):
+    """Casa o padrao contra NOME, caminho RELATIVO a raiz e caminho COMPLETO.
+
+    MEDIDO 11/11 (bug real): o plano de quarentena casava SO o basename, mas os
+    planos pendentes do dono usam padrao de CAMINHO ('outros/id_rsa'). Resultado:
+    'apply --yes' marcava o plano como executado com 0 movidos — silencio do nada.
+    Agora o mesmo padrao casa nas 3 formas (e continua nao casando o que nao deve).
+    """
+    if not pat:
+        return False
+    if match_name(os.path.basename(path), pat):
+        return True
+    rel = safe_rel(path, root)
+    if match_name(rel, pat):
+        return True
+    return match_name(path, pat)
+
+
+def resolve_roots(root_spec):
+    """Resolve o campo 'root' de um plano em (raiz, subpasta) REAIS.
+
+    MEDIDO 11/11 (bug real): '/storage/emulated/0/Download/documentos' nao casa
+    com nenhuma READ_ROOT (que sao ~/storage/shared etc.) -> 0 raizes -> plano
+    executado sem mover NADA. Agora o root e' resolvido por realpath: se o
+    caminho pedido estiver DENTRO de uma raiz permitida, usa essa raiz + subpasta.
+
+    Devolve [(root, subpasta), ...]. subpasta='' = raiz inteira.
+    """
+    if root_spec in ("todo", "", None):
+        return [(r, "") for r in READ_ROOTS]
+    spec = os.path.realpath(os.path.expanduser(root_spec))
+    out = []
+    for r in READ_ROOTS:
+        rr = os.path.realpath(r)
+        if spec == rr:
+            out.append((r, ""))
+        elif spec.startswith(rr.rstrip("/") + "/"):
+            out.append((r, os.path.relpath(spec, rr)))
+    if out:
+        return out
+    # fallback: nome da raiz como rotulo ('shared', 'ssd', ...)
+    return [(r, "") for r in READ_ROOTS if root_spec in r]
+
+
+def cmd_propose(a):
+    """Agente externo DESCREVE; o celular executa depois (com quarentena)."""
+    os.makedirs(PLANS, exist_ok=True)
+    pid = "plan-%s-%s" % (datetime.datetime.now().strftime("%Y%m%dT%H%M%S".replace("T", "-")), os.urandom(2).hex())
+    plan = {
+        "id": pid,
+        "ts": now_iso(),
+        "author": a.author or "externo",
+        "acao": a.acao,
+        "match": a.match or "",
+        "root": a.root or "todo",
+        "to": a.to or "",
+        "note": a.note or "",
+        "status": "proposto",
+        "executed": None,
+        "resultado": None,
+    }
+
+    if a.acao == "moves":
+        # mapa explicito: arquivo JSON com lista [{"de":..., "para":...}, ...]
+        try:
+            with open(a.from_list) as fh:
+                items = json.load(fh)
+        except Exception as e:
+            print("erro lendo --from-list:", e, file=sys.stderr)
+            return 1
+        if isinstance(items, dict):
+            items = items.get("mover", items.get("itens", []))
+        if not isinstance(items, list) or not items:
+            print("--from-list precisa ser uma lista nao vazia de {de, para}", file=sys.stderr)
+            return 1
+        invalidos = []
+        for it in items:
+            src = it.get("de", "")
+            dst = it.get("para", "")
+            if not src or not dst:
+                invalidos.append({"item": it, "motivo": "sem de/para"})
+                continue
+            ok, why = check_move(src, dst)
+            if not ok and why not in ("origem nao existe",):
+                invalidos.append({"de": src, "para": dst, "motivo": why})
+        plan["itens"] = items
+        plan["total_itens"] = len(items)
+        plan["itens_invalidos"] = invalidos
+        plan["bytes_mover"] = sum(int(it.get("size", 0) or 0) for it in items)
+
+    path = os.path.join(PLANS, pid + ".json")
+    with open(path, "w") as f:
+        json.dump(plan, f, ensure_ascii=False, indent=1)
+    print(json.dumps(plan, ensure_ascii=False, indent=1))
+    print("\nPLANO SALVO:", path, file=sys.stderr)
+    print("O celular executa com: phone-fs apply %s --yes" % pid, file=sys.stderr)
+    return 0
+
+
+def cmd_restore(a):
+    """Desfaz um plano ja executado, devolvendo cada arquivo ao lugar de origem.
+
+    MEDIDO 12/11: eu anunciava 'reversivel, com manifesto' em todo plano, mas
+    o phone-fs so sabia MOVER PARA FRENTE. Quando 2 arquivos do plano de teste
+    (07/11) foram devolvidos a mao, o manifesto NAO registrou nada (ele so
+    registra o movimento para frente) e o phone-fs.log tambem nao — ficou
+    impossivel distinguir 'restaurado' de 'perdido' sem inferir comparando
+    caminho e tamanho. Este comando fecha o ciclo: devolve o arquivo E escreve
+    a linha RESTORED no manifesto, para a auditoria ser exata.
+
+    Garantias:
+      - NUNCA apaga: so move de volta o que o manifesto registrou.
+      - NUNCA sobrescreve: se o destino ja existe, pula e reporta.
+      - So mexe onde o manifesto aponta, e so dentro das raizes permitidas.
+      - --dry-run mostra o que seria devolvido, sem tocar em nada.
+    """
+    plan_id = a.plan_id
+    cands = [os.path.join(HOME, "docs", "quarentena-phonefs-%s.txt" % plan_id),
+             os.path.join(HOME, "docs", "movimento-phonefs-%s.txt" % plan_id)]
+    man = next((c for c in cands if os.path.isfile(c)), None)
+    if not man:
+        print("manifesto do plano nao encontrado:", plan_id, file=sys.stderr)
+        return 1
+
+    movidos, pulados = [], []
+    for line in open(man, errors="ignore"):
+        if not line.startswith("MOVED\t"):
+            continue
+        parts = line.rstrip("\n").split("\t", 3)
+        if len(parts) < 4:
+            continue
+        _, de, para, tam = parts
+        de = os.path.abspath(os.path.expanduser(de))
+        para = os.path.abspath(os.path.expanduser(para))
+        # seguranca: os dois lados precisam estar dentro das raizes permitidas
+        ok_de, why_de = check_move(para, de)
+        if not ok_de:
+            # check_move exige que a origem exista; aqui a fonte e' o destino do
+            # manifesto, entao testamos os dois lados a parte
+            if not (in_allowlist(de) and in_allowlist(para)):
+                pulados.append({"path": de, "motivo": "fora das raizes permitidas"})
+                continue
+            if is_personal_dir(de):
+                pulados.append({"path": de, "motivo": "destino em pasta pessoal intocavel"})
+                continue
+        if not os.path.exists(para):
+            pulados.append({"path": de, "motivo": "nao esta no destino (ja devolvido ou ausente)"})
+            continue
+        if os.path.exists(de):
+            pulados.append({"path": de, "motivo": "destino ja ocupado — NAO sobrescrevo"})
+            continue
+        try:
+            size = int(tam)
+        except Exception:
+            size = os.path.getsize(para)
+        movidos.append({"de": de, "para": para, "size": size})
+
+    if a.dry_run:
+        out = {"dry_run": True, "plano": plan_id, "manifesto": man,
+               "seriam_restaurados": len(movidos), "pulados": len(pulados),
+               "bytes": sum(m["size"] for m in movidos),
+               "exemplos": movidos[:5], "pulados_exemplos": pulados[:5]}
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        log_call("restore-dryrun", plan_id, "ok", "restaurados=%d" % len(movidos))
+        return 0
+
+    if not a.yes:
+        print("VAI RESTAURAR %d arquivo(s) do plano %s (nada e apagado):" % (len(movidos), plan_id))
+        for m in movidos[:10]:
+            print("  %s -> %s" % (m["para"], m["de"]))
+        print("Use --yes para confirmar.", file=sys.stderr)
+        return 2
+
+    restaurados = []
+    for m in movidos:
+        try:
+            os.makedirs(os.path.dirname(m["de"]), exist_ok=True)
+            shutil.move(m["para"], m["de"])
+            restaurados.append(m)
+        except Exception as e:
+            pulados.append({"path": m["de"], "motivo": str(e)[:120]})
+
+    with open(man, "a") as f:
+        f.write("\n# restore %s — %s\n" % (plan_id, now_iso()))
+        for m in restaurados:
+            f.write("RESTORED\t%s\t%s\t%d\n" % (m["de"], m["para"], m["size"]))
+        for s in pulados:
+            f.write("SKIPPED_RESTORE\t%s\t%s\n" % (s.get("path", ""), s.get("motivo", "")))
+
+    res = {"plano": plan_id, "restaurados": len(restaurados), "pulados": len(pulados),
+           "bytes": sum(m["size"] for m in restaurados), "manifesto": man}
+    print(json.dumps(res, ensure_ascii=False, indent=1))
+    log_call("restore", plan_id, "ok", "restaurados=%d" % len(restaurados))
+    return 0
+
+
+def cmd_plans(a):
+    if not os.path.isdir(PLANS):
+        print("[]")
+        return 0
+    ps = []
+    for fn in sorted(os.listdir(PLANS), reverse=True)[:40]:
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(PLANS, fn)) as f:
+                ps.append(json.load(f))
+        except Exception:
+            pass
+    if a.json:
+        print(json.dumps(ps, ensure_ascii=False, indent=1))
+    else:
+        for p in ps:
+            print("  %-28s %-10s %-9s %s" % (p["id"], p["status"], p["acao"], p["match"]))
+    return 0
+
+
+def cmd_apply(a):
+    """Executa o plano NO CELULAR. Nunca deleta.
+
+    acao 'quarantine'/'move' (casamento por nome): move p/ QUARENTENA no SSD + manifesto.
+    acao 'moves' (mapa explicito de/para): move para o destino declarado, + manifesto.
+    """
+    path = os.path.join(PLANS, a.plan_id + ".json")
+    if not os.path.isfile(path):
+        print("plano inexistente:", a.plan_id, file=sys.stderr)
+        return 1
+    with open(path) as f:
+        plan = json.load(f)
+    if plan.get("status") == "executado":
+        print("plano ja executado")
+        return 0
+
+    if plan.get("acao") == "moves":
+        return apply_moves(plan, a)
+
+    if not a.yes and not a.dry_run:
+        print("VAI EXECUTAR (mover para quarentena):", json.dumps(plan, ensure_ascii=False))
+        print("Use --yes para confirmar.", file=sys.stderr)
+        return 2
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    qdir = os.path.join(SSD, "quarentena-termux", ts + "-" + a.plan_id)
+    moved, skipped = [], []
+    # MEDIDO 11/11: a raiz agora e' resolvida por realpath e o padrao casa com
+    # nome/caminho relativo/caminho completo (antes: 0 raizes e 0 casamentos).
+    alvos = resolve_roots(plan.get("root"))
+    for r, sub in alvos:
+        base = os.path.join(r, sub) if sub else r
+        for f in walk(base):
+            if not match_path(f["path"], r, plan["match"]):
+                continue
+            if is_personal_dir(f["path"]):
+                skipped.append({"path": f["path"], "motivo": "pasta pessoal intocavel"})
+                continue
+            dest = os.path.join(qdir, f["path"].lstrip("/"))
+            if a.dry_run:
+                moved.append({"de": f["path"], "para": dest, "size": f["size"]})
+                continue
+            try:
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.move(f["path"], dest)
+                moved.append({"de": f["path"], "para": dest, "size": f["size"]})
+            except Exception as e:
+                skipped.append({"path": f["path"], "motivo": str(e)[:120]})
+    if a.dry_run:
+        out = {"dry_run": True, "plan": plan.get("id"), "movidos": len(moved),
+               "pulados": len(skipped), "bytes": sum(m["size"] for m in moved),
+               "quarentena_destino": qdir,
+               "exemplos": moved[:10], "pulados_exemplos": skipped[:10]}
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        log_call("apply-dryrun", plan.get("id", "?"), "ok", "movidos=%d" % len(moved))
+        return 0
+    man = os.path.join(HOME, "docs", "quarentena-phonefs-%s.txt" % a.plan_id)
+    os.makedirs(os.path.dirname(man), exist_ok=True)
+    with open(man, "w") as f:
+        f.write("# phone-fs apply %s — %s\n" % (a.plan_id, now_iso()))
+        f.write("# reversivel: mova de volta de %s\n\n" % qdir)
+        for m in moved:
+            f.write("MOVED\t%s\t%s\t%d\n" % (m["de"], m["para"], m["size"]))
+        for s in skipped:
+            f.write("SKIPPED\t%s\t%s\n" % (s["path"], s["motivo"]))
+    plan["status"] = "executado"
+    plan["executed"] = now_iso()
+    plan["resultado"] = {"movidos": len(moved), "pulados": len(skipped),
+                          "quarentena": qdir, "manifesto": man}
+    with open(path, "w") as f:
+        json.dump(plan, f, ensure_ascii=False, indent=1)
+    print(json.dumps(plan["resultado"], ensure_ascii=False, indent=1))
+    log_call("apply", a.plan_id, "ok", "movidos=%d" % len(moved))
+    return 0
+
+
+def apply_moves(plan, a):
+    """Executa um mapa explicito {de,para}. NUNCA deleta: destino != origem, sempre.
+
+    --dry-run: mostra o que SERIA movido (nada toca o disco alem do log).
+    """
+    items = plan.get("itens") or []
+    moved, skipped = [], []
+    for it in items:
+        src = os.path.abspath(os.path.expanduser(it.get("de", "")))
+        dst = os.path.abspath(os.path.expanduser(it.get("para", "")))
+        if not src or not dst:
+            skipped.append({"path": it.get("de", ""), "motivo": "item sem de/para"})
+            continue
+        ok, why = check_move(src, dst)
+        if not ok:
+            skipped.append({"path": src, "motivo": why})
+            continue
+        size = it.get("size") or (os.path.getsize(src) if os.path.isfile(src) else 0)
+        moved.append({"de": src, "para": dst, "size": int(size)})
+
+    if a.dry_run:
+        out = {"dry_run": True, "plan": plan.get("id"), "movidos": len(moved),
+               "pulados": len(skipped), "bytes": sum(m["size"] for m in moved),
+               "destinos": sorted({os.path.dirname(m["para"]) for m in moved})[:40],
+               "exemplos": moved[:5], "pulados_exemplos": skipped[:5]}
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        log_call("apply-dryrun", plan.get("id", "?"), "ok", "movidos=%d" % len(moved))
+        return 0
+
+    if not a.yes:
+        print("VAI EXECUTAR %d movimento(s) (nada e apagado; tudo com manifesto):" % len(moved))
+        for m in moved[:10]:
+            print("  %s -> %s" % (m["de"], m["para"]))
+        print("Use --yes para confirmar.", file=sys.stderr)
+        return 2
+
+    executados = []
+    for m in moved:
+        try:
+            os.makedirs(os.path.dirname(m["para"]), exist_ok=True)
+            shutil.move(m["de"], m["para"])
+            executados.append(m)
+        except Exception as e:
+            skipped.append({"path": m["de"], "motivo": str(e)[:120]})
+
+    man = os.path.join(HOME, "docs", "movimento-phonefs-%s.txt" % plan.get("id"))
+    os.makedirs(os.path.dirname(man), exist_ok=True)
+    with open(man, "w") as f:
+        f.write("# phone-fs apply (mapa) %s — %s\n" % (plan.get("id"), now_iso()))
+        f.write("# reversivel: mova cada arquivo de volta da coluna 'para' para a coluna 'de'\n")
+        f.write("# autor do plano: %s\n" % (plan.get("author") or "externo"))
+        f.write("#\n")
+        for m in executados:
+            f.write("MOVED\t%s\t%s\t%d\n" % (m["de"], m["para"], m["size"]))
+        for s in skipped:
+            f.write("SKIPPED\t%s\t%s\n" % (s.get("path", ""), s.get("motivo", "")))
+    plan["status"] = "executado"
+    plan["executed"] = now_iso()
+    plan["resultado"] = {"movidos": len(executados), "pulados": len(skipped), "manifesto": man}
+    with open(os.path.join(PLANS, plan["id"] + ".json"), "w") as f:
+        json.dump(plan, f, ensure_ascii=False, indent=1)
+    print(json.dumps(plan["resultado"], ensure_ascii=False, indent=1))
+    log_call("apply-moves", plan.get("id", "?"), "ok", "movidos=%d" % len(executados))
+    return 0
+
+
+def cmd_catalog(a):
+    """Catalogo sha256 (celular + HD) e deteccao de DUPLICATAS por conteudo.
+
+    --compare ARQ: cruza com um catalogo/inventario JSON de outro host (ou o
+    inventory/termux.json local, para detectar drift).
+    Pastas pessoais (DCIM/Documents/Pictures/Music/Movies) sao ignoradas por
+    padrao — use --include-personal so com o owner's OK.
+    """
+    roots = [r for r in READ_ROOTS if (not a.root or a.root in r)]
+    entries = []
+    puladas_pessoais = 0
+    for r in roots:
+        if not os.path.isdir(r):
+            continue
+        for f in walk(r):
+            if is_personal_dir(f["path"]) and not a.include_personal:
+                puladas_pessoais += 1
+                continue
+            entries.append({"path": f["path"], "root": r, "size": f["size"],
+                            "mtime": f["mtime"], "type": f["type"]})
+    t0 = time.time()
+    for e in entries:
+        try:
+            h = hashlib.sha256()
+            with open(e["path"], "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            e["sha256"] = h.hexdigest()
+        except Exception as ex:
+            e["sha256"] = ""
+            e["erro"] = str(ex)[:100]
+    dt = time.time() - t0
+
+    by_hash = {}
+    for e in entries:
+        if e.get("sha256"):
+            by_hash.setdefault(e["sha256"], []).append(e)
+    # ARQUIVO VAZIO: todo mundo com 0 byte tem o MESMO sha256 -> um "grupo de
+    # duplicatas" falso (medido 09/11 no celular: 4 arquivos vazios viravam 1 grupo).
+    # Nao e' duplicata real e nao ha byte a recuperar: fica fora, contabilizado a parte.
+    hashes_vazios = {e["sha256"] for e in entries if e.get("size") == 0 and e.get("sha256")}
+    arquivos_vazios = sum(len(by_hash[h]) for h in hashes_vazios)
+    dup_groups = []
+    for sha, group in by_hash.items():
+        if len(group) < 2 or sha in hashes_vazios:
+            continue
+        desperdicio = sum(g["size"] for g in group) - max(g["size"] for g in group)
+        dup_groups.append({
+            "sha256": sha,
+            "bytes_por_copia": group[0]["size"],
+            "copias": len(group),
+            "bytes_ganhavel": desperdicio,
+            "arquivos": sorted(g["path"] for g in group),
+        })
+    dup_groups.sort(key=lambda d: -d["bytes_ganhavel"])
+    # QUEM gera cada grupo: o grosso do celular e' build artifact de codigo
+    # (~/projects), nao documento do senhor. Sem essa separacao o relatorio
+    # "708 grupos" assusta e esconde os grupos que importam.
+    por_raiz = {}
+    for g in dup_groups:
+        for p in g["arquivos"]:
+            raiz = next((r for r in READ_ROOTS if p.startswith(r)), "outro")
+            por_raiz[raiz] = por_raiz.get(raiz, 0) + 1
+
+    out = {
+        "ts": now_iso(),
+        "host": "termux",
+        "arquivos": len(entries),
+        "bytes": sum(e["size"] for e in entries),
+        "segundos_hash": round(dt, 1),
+        "duplicatas_grupos": len(dup_groups),
+        "bytes_ganhavel_total": sum(d["bytes_ganhavel"] for d in dup_groups),
+        "vazios_ignorados": arquivos_vazios,
+        "duplicatas_por_raiz": por_raiz,
+        "pulados_pastas_pessoais": puladas_pessoais,
+        "duplicatas": dup_groups,
+        "regras": {
+            "intocaveis": sorted(MUTATION_DENY),
+            "leitura": "hash de conteudo; nenhum arquivo alterado",
+        },
+    }
+    if a.full:
+        out["arquivos_detalhe"] = entries
+    if a.compare:
+        try:
+            with open(a.compare) as fh:
+                other = json.load(fh)
+            out["comparado_com"] = a.compare
+            out["comparacao"] = compare_catalog(entries, other)
+        except Exception as e:
+            out["comparacao"] = {"erro": str(e)[:200]}
+
+    # formato v1 (catalogo/v1): o que o `catalog-cross` do repo consome
+    if a.formato_v1:
+        hashes = {}
+        for e in entries:
+            # arquivo VAZIO nao entra no indice de hashes: o hash do vazio e' o
+            # mesmo em TODO device, e ele polui o cruzamento como "identico".
+            if e.get("sha256") and e.get("size", 0) > 0:
+                hashes.setdefault(e["sha256"], []).append(e["path"])
+        files = []
+        for e in entries:
+            files.append({"p": e["path"], "r": os.path.basename(e["root"]),
+                          "s": e["size"], "m": e["mtime"], "t": e["type"], "h": e.get("sha256")})
+        dup_map = {g["sha256"]: g["arquivos"] for g in dup_groups}
+        base = os.path.splitext(a.out)[0] if a.out else os.path.join(CATALOG_DIR, "termux")
+        os.makedirs(os.path.dirname(base), exist_ok=True)
+        v1 = {
+            "ts": out["ts"], "host": "termux", "formato": "catalogo/v1",
+            "roots": [{"label": os.path.basename(r), "path": r} for r in roots],
+            "resumo": {"arquivos": len(entries), "bytes": out["bytes"],
+                       "com_hash": sum(1 for e in entries if e.get("sha256")),
+                       "grupos_duplicados": len(dup_groups),
+                       "arquivos_duplicados": sum(g["copias"] for g in dup_groups),
+                       "bytes_ganhavel": out["bytes_ganhavel_total"],
+                       "vazios_ignorados": arquivos_vazios,
+                       "duplicatas_por_raiz": por_raiz,
+                       "segundos": round(dt, 1)},
+            "duplicatas": dup_map,
+            "files": files,
+        }
+        with open(base + ".json", "w") as f:
+            json.dump(v1, f, ensure_ascii=False, indent=1)
+        with open(base + "-hashes.json", "w") as f:
+            json.dump({"ts": out["ts"], "host": "termux", "hashes": hashes}, f, ensure_ascii=False)
+        with open(base + "-dup.json", "w") as f:
+            json.dump({"ts": out["ts"], "host": "termux",
+                       "grupos": len(dup_groups),
+                       "bytes_ganhavel": out["bytes_ganhavel_total"],
+                       "vazios_ignorados": arquivos_vazios,
+                       "duplicatas_por_raiz": por_raiz,
+                       "duplicatas": dup_map}, f, ensure_ascii=False, indent=1)
+        print("catalogo/v1 salvo:", base + ".json (+ -hashes.json, -dup.json)")
+
+    if a.out:
+        os.makedirs(os.path.dirname(a.out), exist_ok=True)
+        # BUG FIX 08/11: com --formato-v1 o arquivo v1 (base+".json") e o MESMO caminho do
+        # --out; escrever o resumo depois sobrescrevia o v1 e o PC recebia so o resumo
+        # (sem o indice de hashes -> o cruzamento nao conseguia filtrar arquivo vazio).
+        v1_mesmo_caminho = a.formato_v1 and os.path.abspath(a.out) == os.path.abspath(base + ".json")
+        if not v1_mesmo_caminho:
+            with open(a.out, "w") as f:
+                json.dump(out, f, ensure_ascii=False, indent=1)
+            print("catalogo salvo:", a.out)
+        else:
+            print("catalogo v1 salvo:", base + ".json", "(+", base + "-hashes.json,", base + "-dup.json)")
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+    else:
+        print("CATALOGO termux — %d arquivos, %s, hash em %.1fs" % (
+            out["arquivos"], human(out["bytes"]), dt))
+        print("duplicatas: %d grupo(s), %s recuperavel" % (
+            out["duplicatas_grupos"], human(out["bytes_ganhavel_total"])))
+        for d in out["duplicatas"][:12]:
+            print("  %s  %dx  %s  %s" % (d["sha256"][:12], d["copias"],
+                                         human(d["bytes_ganhavel"]), d["arquivos"][0]))
+    return 0
+
+
+def compare_catalog(entries, other):
+    """Cruza o catalogo local (com sha256) com um JSON de outro host.
+
+    Aceita 2 formatos:
+      a) catalogo com {"arquivos":[{path,sha256,...}]} -> cruza hash (duplicatas entre hosts)
+      b) inventario com {"roots":[{root, maiores:[{path,size}]}]} -> mede DRIFT
+         (o arquivo ainda existe? o tamanho bate?)
+    """
+    res = {}
+    local_by_path = {e["path"]: e for e in entries}
+    local_hashes = {}
+    for e in entries:
+        if e.get("sha256"):
+            local_hashes.setdefault(e["sha256"], []).append(e["path"])
+
+    # (a) cruzamento por hash — aceita o formato v1 ({"hashes":{sha:[paths]}})
+    other_files = []
+    other_hashes = {}
+    if isinstance(other, dict):
+        if isinstance(other.get("hashes"), dict):
+            other_hashes = {k: list(v) for k, v in other["hashes"].items() if isinstance(v, list)}
+        for key in ("arquivos", "files", "arquivos_detalhe"):
+            if isinstance(other.get(key), list):
+                other_files = other[key]
+                break
+        if other_files and not other_hashes:
+            for f in other_files:
+                if isinstance(f, dict):
+                    h = f.get("sha256") or f.get("h")
+                    p = f.get("path") or f.get("p")
+                    if h:
+                        other_hashes.setdefault(h, []).append(p or "?")
+    if other_files or other_hashes:
+        cruzados = [{"sha256": sha, "local": paths, "outro_host": other_hashes[sha]}
+                    for sha, paths in local_hashes.items() if sha in other_hashes]
+        res["modo"] = "hash"
+        res["arquivos_outro_host"] = len(other_files) or sum(len(v) for v in other_hashes.values())
+        res["hashes_conferidos"] = len(other_hashes)
+        res["hashes_identicos_entre_hosts"] = len(cruzados)
+        res["bytes_ganhavel_cruzado"] = sum(
+            sum(os.path.getsize(p) for p in c["local"] if os.path.isfile(p))
+            for c in cruzados)
+        res["amostra"] = cruzados[:30]
+
+    # (b) drift contra o inventario
+    if isinstance(other, dict) and isinstance(other.get("roots"), list):
+        drifted, missing, ok = [], [], 0
+        fora_politica = []
+        for r in other["roots"]:
+            for m in (r.get("maiores") or []):
+                p = m.get("path")
+                if not p:
+                    continue
+                # MEDIDO 09/11: o INVENTARIO pode olhar as pastas pessoais (so
+                # metadados, por decisao do dono), mas o CATALOGO as exclui por
+                # politica. Sem esta pular, cada foto pessoal do inventario
+                # aparecia como DRIFT "presente mas nao catalogado" — falso
+                # positivo que faz o relatorio de drift nao significar nada.
+                if is_personal_dir(p):
+                    fora_politica.append(p)
+                    continue
+                if p not in local_by_path:
+                    if not os.path.exists(p):
+                        missing.append(p)
+                    else:
+                        drifted.append({"path": p, "motivo": "presente mas nao catalogado",
+                                        "size_inv": m.get("size"),
+                                        "size_agora": os.path.getsize(p)})
+                    continue
+                cur = local_by_path[p]
+                if cur["size"] != m.get("size"):
+                    drifted.append({"path": p, "motivo": "tamanho mudou",
+                                    "size_inv": m.get("size"), "size_agora": cur["size"]})
+                else:
+                    ok += 1
+        res["modo"] = "drift"
+        res["arquivos_conferidos"] = ok + len(drifted) + len(missing)
+        res["iguais"] = ok
+        res["drift"] = drifted[:40]
+        res["sumiram_do_inventario"] = missing[:40]
+        res["fora_por_politica"] = len(fora_politica)
+    return res
+
+
+SENSITIVE_PATTERNS = [
+    ("chave privada", r"(^id_rsa$|^id_dsa$|^id_ecdsa$|^id_ed25519$|\.pem$|\.key$|\.p12$|\.pfx$|\.ppk$)"),
+    ("ssh config/authorized_keys", r"(^authorized_keys$|^ssh_config$|^config$)"),
+    ("export de senhas", r"(password|senha|passwd|credential|credencial|login)"),
+    ("token/segredo", r"(\.env$|token|secret|api[_-]?key)"),
+    ("nome indica sofrimento/ajuda urgente", r"(suicid|crise|\bemerg\b|preciso de ajuda)"),
+]
+
+
+def cmd_sensitive(a):
+    """Lista itens de RISCO no storage do dono (so metadados, NUNCA le conteudo).
+
+    Sai da allowlist do walk() normal de proposito: o storage COMPARTILHADO e'
+    legivel por qualquer app com permissao, entao chave privada / export de
+    senhas / config SSH la dentro e' um ACHADO que so o dono pode decidir
+    (mover? revogar? deletar?).
+    """
+    achados = []
+    varridas = 0
+    for r in READ_ROOTS:
+        if not os.path.isdir(r):
+            continue
+        for dp, dn, fns in os.walk(r, followlinks=False):
+            dn[:] = [d for d in dn if d not in ("data", "obb") and not d.startswith(".")
+                     and not any(s.lower() in d.lower() for s in SKIP_DIR_PARTS)]
+            for fn in fns:
+                varridas += 1
+                baixo = fn.lower()
+                for rotulo, pat in SENSITIVE_PATTERNS:
+                    if re.search(pat, baixo, re.I):
+                        try:
+                            st = os.stat(os.path.join(dp, fn))
+                            size = st.st_size
+                            mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d")
+                        except OSError:
+                            size, mtime = 0, "?"
+                        achados.append({"motivo": rotulo, "nome": fn,
+                                        "path": os.path.join(dp, fn), "size": size,
+                                        "mtime": mtime,
+                                        "compartilhado": r.endswith("storage/shared"),
+                                        "vazio": size == 0})
+                        break
+    achados.sort(key=lambda x: (not x["compartilhado"], x["motivo"], x["path"]))
+    out = {"ts": now_iso(), "host": "termux", "arquivos_varridos": varridas,
+           "achados": achados, "total": len(achados),
+           "nota": "so metadados (nome/caminho/tamanho/data); NENHUM conteudo lido"}
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+    else:
+        print("ITENS SENSIVEIS NO STORAGE (so metadados) — %d achado(s) em %d arquivos varridos"
+              % (len(achados), varridas))
+        for x in achados:
+            marca = " [COMPARTILHADO]" if x["compartilhado"] else ""
+            vazio = " [VAZIO]" if x["vazio"] else ""
+            print("  %-34s %8s B  %s%s%s" % (x["motivo"], x["size"], x["path"][-70:], marca, vazio))
+    return 0
+
+
+def cmd_ocr_chamadas(a):
+    """Lista as ferramentas de extracao/OCR disponiveis no HOST (via SSH).
+
+    O celular nao tem OCR; o host Linux tem (tesseract + poppler via nix shell).
+    Serve para o agente discover que pode extrair texto de PDF escaneado —
+    o texto volta para o indice LOCAL do celular (o phone-fs nao extrai nada).
+    """
+    host = a.host
+    user = os.environ.get("HOST_USER", "nixos")
+    probe = r"""for t in tesseract pdftotext pdftoppm pdfimages ocrmypdf mutool gs qpdf python3; do
+  p=$(command -v $t 2>/dev/null) && echo "  $t: $p"
+done
+echo "  nix-poppler: $(timeout 60 nix shell nixpkgs#poppler-utils -c pdftoppm -v 2>&1 | head -1)"
+echo "  host: $(hostname) | ip: $1"
+"""
+    out = ""
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                            f"{user}@{host}", "bash -s -- " + host],
+                           input=probe, capture_output=True, text=True, timeout=120)
+        out = r.stdout
+    except Exception as e:
+        out = f"  (nao consegui falar com o host: {str(e)[:60]})\n"
+    print("FERRAMENTAS DE EXTRACAO/OCR NO HOST (para PDFs escaneados):")
+    print(out.rstrip() or "  (nenhuma)")
+    print()
+    print("  uso: caso-ocr (extrai e devolve o texto para o indice LOCAL do celular)")
+    print("       (o phone-fs so LE; o texto sensivel nao sai do celular)")
+    return 0
+
+
+def cmd_roots(a):
+    print(json.dumps({
+        "read": READ_ROOTS,
+        "deny_paths": DENY_PARTS,
+        "intocaveis_mutacao": sorted(MUTATION_DENY),
+        "ssd": SSD,
+        "max_read_bytes": MAX_READ,
+        "ssh": "ssh -p 8022 u0_a438@${TA_PHONE_IP:-100.104.175.123} '~/bin/phone-fs <cmd>'",
+    }, ensure_ascii=False, indent=1))
+    return 0
+
+
+def cmd_health(a):
+    out = {"ts": now_iso()}
+    out["sshd_8022"] = subprocess.run(
+        ["bash", "-c", "timeout 4 bash -c 'cat < /dev/null > /dev/tcp/${TA_PHONE_IP:-100.104.175.123}/8022' && echo UP || echo DOWN"],
+        capture_output=True, text=True).stdout.strip()
+    out["disk_livre"] = subprocess.run(["df", "-k", HOME], capture_output=True, text=True).stdout.strip().splitlines()[-1]
+    out["ssd"] = subprocess.run(["df", "-k", SSD], capture_output=True, text=True).stdout.strip().splitlines()[-1] if os.path.isdir(SSD) else "ausente"
+    out["jobs"] = subprocess.run(["bash", "-c", "termux-job-scheduler --pending 2>/dev/null | grep -c 'Pending Job'"],
+                                 capture_output=True, text=True).stdout.strip()
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="acesso seguro aos arquivos do celular")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("inventory"); p.add_argument("--json", action="store_true"); p.add_argument("--root"); p.add_argument("--top", type=int, default=5); p.set_defaults(fn=cmd_inventory)
+    p = sub.add_parser("find"); p.add_argument("term"); p.add_argument("--root"); p.add_argument("--type"); p.add_argument("--since"); p.add_argument("--max", type=int, default=DEFAULT_MAX_FIND); p.add_argument("--json", action="store_true"); p.add_argument("--path", action="store_true", help="casa o termo no CAMINHO (nao so no nome do arquivo) — comportamento PADRAO"); p.add_argument("--so-nome", action="store_true", help="casa o termo SO no nome do arquivo (o comportamento antigo, que erra as pastas tematicas do dono)"); p.add_argument("--dir", help="so arquivos dentro desta pasta (substring do caminho)"); p.set_defaults(fn=cmd_find)
+    p = sub.add_parser("stat"); p.add_argument("path"); p.set_defaults(fn=cmd_stat)
+    p = sub.add_parser("cat"); p.add_argument("path"); p.add_argument("--max", type=int, default=MAX_READ); p.set_defaults(fn=cmd_cat)
+    p = sub.add_parser("propose"); p.add_argument("acao", choices=["move", "quarantine", "moves"]); p.add_argument("--match"); p.add_argument("--root"); p.add_argument("--to"); p.add_argument("--note"); p.add_argument("--author"); p.add_argument("--from-list"); p.set_defaults(fn=cmd_propose)
+    p = sub.add_parser("plans"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_plans)
+    p = sub.add_parser("apply"); p.add_argument("plan_id"); p.add_argument("--yes", action="store_true"); p.add_argument("--dry-run", action="store_true"); p.set_defaults(fn=cmd_apply)
+    p = sub.add_parser("restore"); p.add_argument("plan_id"); p.add_argument("--yes", action="store_true"); p.add_argument("--dry-run", action="store_true"); p.set_defaults(fn=cmd_restore)
+    p = sub.add_parser("catalog"); p.add_argument("--json", action="store_true"); p.add_argument("--root"); p.add_argument("--out"); p.add_argument("--compare"); p.add_argument("--full", action="store_true"); p.add_argument("--include-personal", action="store_true"); p.add_argument("--formato-v1", action="store_true", help="grava tambem no formato catalogo/v1 (consumido pelo catalog-cross)"); p.set_defaults(fn=cmd_catalog)
+    p = sub.add_parser("sensitive"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_sensitive)
+    p = sub.add_parser("roots"); p.set_defaults(fn=cmd_roots)
+    p = sub.add_parser("ocr-chamadas")
+    p.add_argument("--host", default=os.environ.get("HOST_IP", "${TA_LINUX_IP4:-100.121.100.103}"))
+    p.set_defaults(fn=cmd_ocr_chamadas)
+    p = sub.add_parser("health"); p.set_defaults(fn=cmd_health)
+
+    a = ap.parse_args()
+    if not getattr(a, "fn", None):
+        ap.print_help()
+        return 2
+    try:
+        rc = a.fn(a)
+    except Exception as e:
+        log_call(a.cmd, [], "error", str(e)[:200])
+        print("ERRO:", e, file=sys.stderr)
+        return 1
+    log_call(a.cmd, [x for x in sys.argv[2:] if not x.startswith("--")], "ok" if rc == 0 else "rc=%s" % rc)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

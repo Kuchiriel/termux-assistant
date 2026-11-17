@@ -1,0 +1,63 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-offline — menu de emergência 100% offline (corpus local, sem API/LLM).
+#
+# Fluxo: radio de categorias -> (opcional) texto livre -> `offline` -> caixa de
+# resultado (selecionável/copiável). Nada de rede: nem DNS, nem API, nem modelo.
+#
+# Teste sem tocar na tela:  OFFLINE_WIDGET_QUERY="picada de cobra" bash ~/.termux/widget/crouton-offline
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+
+if [ ! -f "$HOME/offline-corpus/corpus.db" ]; then
+  printf 'Corpus offline ausente.\nRode: offline-build --force\n' | termux-toast -g middle
+  exit 1
+fi
+
+ask() {
+  termux-dialog radio -t "Socorro offline (sem internet)" \
+    -v "Queimadura,Picada ou mordida,Engasgo,Afogamento,Parada cardiaca (CPR),Agua potavel,Febre em crianca,Desidratacao e diarreia,Ferida sangrando,Fratura ou entorse,Calor ou hipotermia,Perguntar com texto livre" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("index",-1))'
+}
+
+pick_question() {
+  case "$1" in
+    0) echo "queimadura o que fazer" ;;
+    1) echo "picada de cobra" ;;
+    2) echo "engasgo bebe" ;;
+    3) echo "afogamento" ;;
+    4) echo "parada cardiaca" ;;
+    5) echo "purificar agua" ;;
+    6) echo "febre em crianca" ;;
+    7) echo "desidratacao e diarreia" ;;
+    8) echo "ferida sangrando" ;;
+    9) echo "fratura ou entorse" ;;
+    10) echo "insolacao ou hipotermia" ;;
+    *) echo "" ;;
+  esac
+}
+
+query="${OFFLINE_WIDGET_QUERY:-}"
+if [ -z "$query" ]; then
+  idx="$(ask)"
+  [ -z "$idx" ] || [ "$idx" = "-1" ] && exit 0
+  query="$(pick_question "$idx")"
+fi
+
+if [ -z "$query" ]; then
+  query="$(termux-dialog text -t "Pergunta (PT ou EN)" -i "" \
+    | python3 -c 'import json,sys; print((json.load(sys.stdin).get("text") or "").strip())')"
+fi
+[ -z "$query" ] && exit 0
+
+# Busca local: ~0,3 s. Nunca levanta; exit 1 = sem fonte confiável.
+result="$(timeout 20 offline "$query" -k 3 2>&1)"
+rc=$?
+
+termux-vibrate -d 40 2>/dev/null || true
+if [ "${OFFLINE_WIDGET_STDOUT:-0}" = "1" ]; then
+  printf '%s\n' "$result"
+  exit "$rc"
+fi
+termux-dialog text -t "Offline: $query" -i "$result" >/dev/null 2>&1 || \
+  printf '%s\n' "$result" | termux-toast -g middle
+exit "$rc"

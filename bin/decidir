@@ -1,0 +1,363 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""decidir - pergunta ao dono na TELA DE BLOQUEIO, com ate 3 botoes.
+
+POR QUE EXISTE: o gargalo da frota nao e' a maquina trabalhar, e' o dono DECIDIR.
+Hoje a decisao chega como texto no chat (ele precisa abrir o Termux, ler 40 linhas,
+achar a pergunta). Aqui a pergunta vira notificacao com botao: ele resolve na tela
+de bloqueio, sem abrir nada, e a resposta fica registrada em disco.
+
+    decidir "Rodar o PR #1 agora?" "Sim" "Nao"
+    decidir --titulo "Frota" "Publicar o brief?" "Sim" "Depois" "Ignorar"
+    decidir --acao-sim "make deploy" "Subir pra producao?" "Sim" "Nao"
+
+    decidir --lista                 # pendentes (e as ja respondidas de hoje)
+    decidir --resposta <id>         # a resposta de uma pergunta
+    decidir --esperar <id> 300      # bloqueia ate responder (timeout em s)
+    decidir --limpar                # remove notificacoes velhas
+
+    decidir --json ...              # saida em JSON
+
+ESTADO: ~/.local/state/decisoes/<id>.json  (local, nunca vai pro bus/repo)
+RESPOSTA: ~/bin/decidir-resposta <id> <n>  (e' o que o botao executa)
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+BIN = os.path.join(HOME, "bin")
+STATE = os.path.join(HOME, ".local/state/decisoes")
+LOG = os.path.join(STATE, "respostas.log")
+NOTIF_ID = "dec-"          # prefixo do id da notificacao no Android
+MAX_OPCOES = 3             # o Android/Termux:API expoe no maximo 3 botoes
+
+
+# ---------------------------------------------------------------- utilidades
+def agora():
+    return dt.datetime.now().replace(microsecond=0).isoformat()
+
+
+def epoch():
+    return int(time.time())
+
+
+def rodar(cmd, timeout=20):
+    """roda sem levantar excecao; devolve (rc, stdout, stderr)."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except Exception as e:  # noqa: BLE001
+        return 1, "", str(e)
+
+
+def notificar(titulo, texto, nid, botoes=(), prio="max"):
+    """manda a notificacao com botoes; devolve True se o Termux:API respondeu."""
+    cmd = ["termux-notification", "--id", nid, "--title", titulo[:64],
+           "--content", texto[:420], "--priority", prio, "--group", "decisoes"]
+    for i, (rotulo, acao) in enumerate(botoes[:MAX_OPCOES], start=1):
+        cmd += ["--button%d" % i, rotulo[:22],
+                "--button%d-action" % i, acao]
+    rc, _, err = rodar(cmd, timeout=25)
+    if rc != 0:
+        print("aviso: termux-notification falhou (%s) - a pergunta fica so em disco"
+              % (err.splitlines()[0][:80] if err else rc), file=sys.stderr)
+    return rc == 0
+
+
+def tocar(texto="", titulo="Crouton Alpha"):
+    rodar(["termux-toast", "-g", "middle", texto[:120]], timeout=10)
+    rodar(["termux-vibrate", "-d", "180", "-f"], timeout=10)
+
+
+def caminho(iid):
+    return os.path.join(STATE, "%s.json" % iid)
+
+
+def novo_id():
+    n = 1
+    while os.path.exists(caminho("d%04d" % n)):
+        n += 1
+    return "d%04d" % n
+
+
+def salvar(d):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = caminho(d["id"]) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, ensure_ascii=False, indent=1)
+    os.replace(tmp, caminho(d["id"]))
+
+
+def carregar(iid):
+    iid = os.path.basename(iid).replace(".json", "")
+    try:
+        with open(caminho(iid), encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return None
+
+
+def todas():
+    os.makedirs(STATE, exist_ok=True)
+    out = []
+    for nome in sorted(os.listdir(STATE)):
+        if not nome.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(STATE, nome), encoding="utf-8") as fh:
+                out.append(json.load(fh))
+        except Exception:  # noqa: BLE001
+            continue
+    out.sort(key=lambda d: d.get("criada_epoch", 0))
+    return out
+
+
+def idade(d):
+    s = epoch() - d.get("criada_epoch", epoch())
+    if s < 3600:
+        return "%d min" % (s // 60)
+    if s < 86400:
+        return "%.1f h" % (s / 3600.0)
+    return "%d d" % (s // 86400)
+
+
+# -------------------------------------------------------------------- acoes
+def acao_ask(args):
+    if not args.pergunta:
+        return erro("falta a pergunta", args)
+    opcoes = [o for o in args.opcoes if o.strip()]
+    if not 1 <= len(opcoes) <= MAX_OPCOES:
+        return erro("1 a %d opcoes (o Android so mostra 3 botoes)" % MAX_OPCOES, args)
+
+    iid = novo_id()
+    acoes = {}
+    mapa = {"--acao-1": args.acao1, "--acao-2": args.acao2, "--acao-3": args.acao3}
+    for i, cmd in enumerate([args.acao1, args.acao2, args.acao3], start=1):
+        if cmd and i <= len(opcoes):
+            acoes[str(i)] = cmd
+
+    d = {
+        "id": iid, "titulo": args.titulo, "pergunta": args.pergunta,
+        "opcoes": opcoes, "acoes": acoes,
+        "estado": "pendente", "resposta": None, "resposta_n": None,
+        "criada": agora(), "criada_epoch": epoch(),
+        "respondida": None, "origem": args.origem,
+        # MEDIDO 13/11: a pergunta 'ligue o carregador' continuava pendente (e
+        # seria re-cobrada pelo pendencia) DEPOIS de o carregador estar ligado.
+        # Uma pergunta cuja PREMISSA mudou nao deve perseguir o dono: a
+        # condicao e' um comando que devolve 0 enquanto a pergunta vale.
+        "condicao": args.condicao or None,
+    }
+    salvar(d)
+
+    # os botoes chamam o wrapper: caminho ABSOLUTO (o Termux:API abre sessao nova)
+    resp = os.path.join(BIN, "decidir-resposta")
+    botoes = [(op, "%s %s %d" % (resp, iid, i)) for i, op in enumerate(opcoes, start=1)]
+    corpo = args.pergunta
+    if len(opcoes) == 1:
+        corpo += "\n(toque em '%s')" % opcoes[0]
+    ok = notificar(args.titulo, corpo, NOTIF_ID + iid, botoes,
+                   prio="max" if args.urgente else "high")
+
+    if args.json:
+        print(json.dumps({"id": iid, "notificado": ok, "opcoes": opcoes},
+                         ensure_ascii=False))
+    else:
+        print("%s  %s" % (iid, args.pergunta))
+        print("     " + " | ".join("%d=%s" % (i, o) for i, o in enumerate(opcoes, 1)))
+        print("     %s" % ("notificacao enviada" if ok else "SEM notificacao (so disco)"))
+    return 0
+
+
+def acao_answer(iid, n):
+    d = carregar(iid)
+    if not d:
+        print("sem decisao %s" % iid, file=sys.stderr)
+        return 2
+    if d["estado"] == "respondida":
+        tocar("ja respondida: %s" % d["resposta"])
+        print(d["resposta"])
+        return 0
+    try:
+        n = int(n)
+        op = d["opcoes"][n - 1]
+    except (ValueError, IndexError):
+        print("opcao invalida: %s" % n, file=sys.stderr)
+        return 2
+
+    d.update(estado="respondida", resposta=op, resposta_n=n,
+             respondida=agora(), respondida_epoch=epoch())
+    salvar(d)
+
+    rodar(["termux-notification-remove", NOTIF_ID + d["id"]], timeout=15)
+    tocar("respondido: %s" % op)
+
+    with open(LOG, "a", encoding="utf-8") as fh:
+        fh.write("%s\t%s\t%s\t%s\n" % (d["respondida"], d["id"], op, d["pergunta"]))
+
+    cmd = (d.get("acoes") or {}).get(str(n))
+    if cmd:
+        # roda destacado: a sessao do Termux:API morre em seguida
+        subprocess.Popen(["bash", "-lc", cmd], cwd=HOME,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    print(op)
+    return 0
+
+
+def acao_lista(args):
+    ds = todas()
+    pend = [d for d in ds if d.get("estado") == "pendente"]
+    # MEDIDO 13/11: a pergunta que fecha sozinha (a premissa mudou) sumia do
+    # historico — o dono nao via que aquilo foi resolvido sem ele. Agora ela
+    # aparece, marcada como tal.
+    feitas = [d for d in ds if d.get("estado") in ("respondida", "resolvida_sozinha")]
+    if args.json:
+        print(json.dumps({"pendentes": pend, "respondidas": feitas[-20:]},
+                         ensure_ascii=False, indent=1))
+        return 0
+    if not pend:
+        print("nenhuma decisao pendente.")
+    else:
+        print("PENDENTES (%d):" % len(pend))
+        for d in pend:
+            print("  %s  [%s] %s" % (d["id"], idade(d), d["pergunta"][:90]))
+            print("        " + " | ".join("%d=%s" % (i, o) for i, o in
+                                          enumerate(d["opcoes"], 1)))
+    if feitas:
+        print("\nRESPONDIDAS (ultimas):")
+        for d in feitas[-6:]:
+            marca = "sozinha" if d.get("estado") == "resolvida_sozinha" else "->"
+            print("  %s  %s %s %s" % (d["id"], (d.get("respondida") or "")[:16], marca,
+                                       d.get("resposta", "")))
+    return 0
+
+
+def acao_esperar(args):
+    limite = args.timeout or 300
+    t0 = time.time()
+    while time.time() - t0 < limite:
+        d = carregar(args.id)
+        if not d:
+            print("sem decisao %s" % args.id, file=sys.stderr)
+            return 2
+        if d["estado"] == "respondida":
+            print(d["resposta"] if not args.json else
+                  json.dumps({"id": d["id"], "resposta": d["resposta"],
+                              "n": d["resposta_n"]}, ensure_ascii=False))
+            return 0
+        time.sleep(2)
+    print("timeout: %s ainda pendente" % args.id, file=sys.stderr)
+    return 3
+
+
+def acao_renotificar(iid, urgente=False):
+    """reenvia a notificacao de uma decisao PENDENTE (mesmo id = substitui, nao duplica)."""
+    d = carregar(iid)
+    if not d:
+        print("sem decisao %s" % iid, file=sys.stderr)
+        return 2
+    if d["estado"] != "pendente":
+        print("%s ja respondida (%s)" % (iid, d["resposta"]), file=sys.stderr)
+        return 0
+    resp = os.path.join(BIN, "decidir-resposta")
+    botoes = [(op, "%s %s %d" % (resp, d["id"], i))
+              for i, op in enumerate(d["opcoes"], start=1)]
+    ok = notificar(d["titulo"], d["pergunta"], NOTIF_ID + d["id"], botoes,
+                   prio="max" if urgente else "high")
+    print("renotificada %s (%s)" % (d["id"], "ok" if ok else "falhou"))
+    return 0 if ok else 2
+
+
+def acao_limpar(args):
+    n = 0
+    for d in todas():
+        if d.get("estado") == "pendente" and epoch() - d.get("criada_epoch", 0) > 86400:
+            d["estado"] = "expirada"
+            salvar(d)
+            rodar(["termux-notification-remove", NOTIF_ID + d["id"]], timeout=15)
+            n += 1
+        elif d.get("estado") == "respondida":
+            rodar(["termux-notification-remove", NOTIF_ID + d["id"]], timeout=15)
+    print("%d expirada(s) apos 24 h" % n)
+    return 0
+
+
+def erro(msg, args):
+    print("decidir: %s" % msg, file=sys.stderr)
+    print("veja: decidir --help", file=sys.stderr)
+    return 2
+
+
+# --------------------------------------------------------------------- main
+def main(argv):
+    ap = argparse.ArgumentParser(
+        prog="decidir", add_help=True,
+        description="pergunta ao dono com botoes na tela de bloqueio",
+        epilog="ex.: decidir --titulo Frota 'Publicar o brief?' Sim Nao")
+    ap.add_argument("pergunta", nargs="?", help="a pergunta (curta)")
+    ap.add_argument("opcoes", nargs="*", help="1 a 3 opcoes (= botoes)")
+    ap.add_argument("--titulo", default="Crouton Alpha", help="titulo da notificacao")
+    ap.add_argument("--acao-1", dest="acao1", help="comando se escolher a opcao 1")
+    ap.add_argument("--acao-2", dest="acao2", help="comando se escolher a opcao 2")
+    ap.add_argument("--acao-3", dest="acao3", help="comando se escolher a opcao 3")
+    ap.add_argument("--origem", default="manual", help="quem perguntou (heartbeat, owner-brief...)")
+    ap.add_argument("--condicao", default="",
+                    help="comando que checa se a pergunta AINDA VALE (exit 0 = vale; "
+                         "diferente de 0 = a premissa mudou e a pergunta fecha sozinha)")
+    ap.add_argument("--urgente", action="store_true", help="prioridade maxima/som")
+    ap.add_argument("--json", action="store_true", help="saida em JSON")
+    ap.add_argument("--lista", "--list", dest="lista", action="store_true")
+    ap.add_argument("--responder", dest="resp_id_gravar", metavar="ID",
+                    help="registra a resposta (usado pelos botoes)")
+    ap.add_argument("--renotificar", dest="renot_id", metavar="ID",
+                    help="reenvia a notificacao de uma decisao pendente")
+    ap.add_argument("--opcao", dest="opcao_n", type=int, default=1,
+                    help="numero da opcao escolhida (com --responder)")
+    ap.add_argument("--resposta", dest="resp_id", metavar="ID")
+    ap.add_argument("--esperar", dest="esperar_id", metavar="ID")
+    ap.add_argument("--limpar", action="store_true")
+    ap.add_argument("--timeout", type=int, default=300, help="segundos no --esperar")
+    a = ap.parse_args(argv)
+
+    if a.lista:
+        return acao_lista(a)
+    if a.limpar:
+        return acao_limpar(a)
+    if a.resp_id_gravar:
+        return acao_answer(a.resp_id_gravar, a.opcao_n)
+    if a.renot_id:
+        return acao_renotificar(a.renot_id, a.urgente)
+    if a.resp_id:
+        d = carregar(a.resp_id)
+        if not d:
+            print("sem decisao %s" % a.resp_id, file=sys.stderr)
+            return 2
+        if a.json:
+            print(json.dumps(d, ensure_ascii=False))
+        else:
+            print("%s %s => %s" % (d["id"],
+                                   d["pergunta"][:70],
+                                   d["resposta"] or "(pendente)"))
+        return 0
+    if a.esperar_id:
+        return acao_esperar(a)
+    if a.pergunta:
+        return acao_ask(a)
+    # sem argumento: mostra o que esta pendente (util no widget)
+    return acao_lista(a)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

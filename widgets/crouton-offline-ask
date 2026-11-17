@@ -1,0 +1,21 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-offline-ask — uma pergunta livre, resposta do corpus local.
+# Sem internet, sem API, sem LLM: só SQLite FTS5 em ~/offline-corpus/corpus.db.
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+
+q="${OFFLINE_WIDGET_QUERY:-}"
+if [ -z "$q" ]; then
+  q="$(termux-dialog text -t "Pergunta de sobrevivencia (PT/EN)" -i "" \
+    | python3 -c 'import json,sys; print((json.load(sys.stdin).get("text") or "").strip())')"
+fi
+[ -z "$q" ] && exit 0
+
+out="$(timeout 20 offline "$q" -k 3 2>&1)"
+termux-vibrate -d 40 2>/dev/null || true
+if [ "${OFFLINE_WIDGET_STDOUT:-0}" = "1" ]; then
+  printf '%s\n' "$out"
+  exit 0
+fi
+termux-dialog text -t "Offline: $q" -i "$out" >/dev/null 2>&1 || \
+  printf '%s\n' "$out" | termux-toast -g middle

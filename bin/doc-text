@@ -1,0 +1,122 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""doc-text - extrai o TEXTO dos documentos do dono (roda no celular, nao sai de la).
+
+Por que: 220 dos 308 PDFs do storage tem texto extraivel (medido 08/11/2026) e
+o processo judicial do dono (TJSP 1005249-27.2023.8.26.0577, indenizacao por
+dano moral contra 'Coworking de Servicos Medicos') estava entre eles — com as
+DATAS que a lista de trabalho da noite pedia.
+
+Regras:
+  - o texto e' lido NO CELULAR e so sai se VOCE pedir (--out / stdout);
+  - nao escreve nada no storage do dono;
+  - PDF criptografado (AES) precisa de 'cryptography' — o Termux nao tem build
+    facil; nesses casos o caminho e extrair no Linux (que tem pdftotext);
+  - so stdlib + pypdf (instalado via pip).
+
+    doc-text ARQUIVO.pdf                 # imprime o texto
+    doc-text ARQUIVO.pdf --grep DATA    # so as linhas que casam (com contexto)
+    doc-text --root DIR --grep termo --json
+    doc-text --root DIR --list          # quais PDFs tem texto extraivel
+"""
+import argparse
+import json
+import logging
+import os
+import re
+import sys
+
+logging.disable(logging.CRITICAL)
+try:
+    from pypdf import PdfReader
+except ImportError:
+    print("pypdf ausente: pip install pypdf", file=sys.stderr)
+    sys.exit(2)
+
+SKIP_DIR_PARTS = ["com.whatsapp", "databases", "backups", "keystore", ".ssh",
+                   ".gnupg", "DCIM", "Pictures", "Documents", "Movies", "Music"]
+
+
+def texto(path):
+    r = PdfReader(path)
+    partes = []
+    for pg in r.pages:
+        try:
+            partes.append(pg.extract_text() or "")
+        except Exception:
+            partes.append("")
+    return "\n".join(partes)
+
+
+def walk(root):
+    for dp, dn, fn in os.walk(root, followlinks=False):
+        dn[:] = [d for d in dn if d not in SKIP_DIR_PARTS and not d.startswith(".")]
+        for f in fn:
+            if f.lower().endswith(".pdf"):
+                yield os.path.join(dp, f)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="texto dos PDFs do dono (fica no celular)")
+    ap.add_argument("arquivo", nargs="?")
+    ap.add_argument("--root")
+    ap.add_argument("--grep", default="")
+    ap.add_argument("--contexto", type=int, default=120)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--out")
+    ap.add_argument("--max", type=int, default=20)
+    a = ap.parse_args()
+    if a.arquivo:
+        try:
+            t = texto(a.arquivo)
+        except Exception as e:
+            print("ERRO:", type(e).__name__, str(e)[:120], file=sys.stderr)
+            return 1
+        if a.out:
+            with open(a.out, "w", encoding="utf-8") as f:
+                f.write(t)
+            print("texto salvo:", a.out, "(%d chars)" % len(t))
+            return 0
+        if a.grep:
+            rx = re.compile(a.grep, re.I)
+            for m in rx.finditer(t):
+                ini = max(0, m.start() - a.contexto)
+                print("..." + " ".join(t[ini:m.end() + a.contexto].split()) + "...")
+            return 0
+        print(" ".join(t.split()))
+        return 0
+    if not a.root:
+        ap.print_help()
+        return 2
+    root = os.path.expanduser(a.root)
+    itens = []
+    for p in walk(root):
+        try:
+            t = texto(p)
+        except Exception as e:
+            itens.append({"path": p, "chars": 0, "erro": type(e).__name__})
+            continue
+        if a.list:
+            itens.append({"path": p, "chars": len(t)})
+            continue
+        if a.grep:
+            rx = re.compile(a.grep, re.I)
+            for m in rx.finditer(t):
+                ini = max(0, m.start() - a.contexto)
+                itens.append({"path": p, "trecho": " ".join(t[ini:m.end() + a.contexto].split())})
+        else:
+            itens.append({"path": p, "chars": len(t)})
+    if a.json:
+        print(json.dumps(itens, ensure_ascii=False, indent=1))
+    else:
+        for x in itens[:a.max]:
+            if "trecho" in x:
+                print("%s\n   %s\n" % (x["path"], x["trecho"]))
+            else:
+                print("%7d chars  %s%s" % (x.get("chars", 0), x["path"],
+                                            ("  [" + x["erro"] + "]") if x.get("erro") else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

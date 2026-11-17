@@ -1,0 +1,18 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-host - saude do PC NixOS (nitro-v15) vista da tela inicial do celular.
+# Le pelo .onion (Tor): RAM, swap/zram, sessoes opencode e veredito de risco.
+# Sai do ar em VERMELHO se o host estiver no limite de swap (foi assim que travou).
+
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+out=$(timeout 120 "$HOME/bin/host-watch" widget 2>&1 | head -2)
+if [[ -z "$out" ]]; then
+  echo "host inacessivel (Tor on / .onion?)"
+  exit 1
+fi
+veredito=$(printf '%s' "$out" | head -1)
+case "$veredito" in
+  CRITICO*) termux-toast "Host em RISCO de travamento" >/dev/null 2>&1 || true ;;
+  ATENCAO*) termux-toast "Host com memoria apertada" >/dev/null 2>&1 || true ;;
+esac
+printf '%s\n' "$out"

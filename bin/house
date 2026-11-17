@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""house — índice único da casa (ai-mesh).
+
+A pergunta que este comando responde em uma chamada:
+  "onde mora X, qual o entrypoint, qual o doc, qual a última medição?"
+
+Fonte da verdade: index/house.json (este repo). HOME.md é a porta de entrada
+humana; docs/house/<id>.md é gerado (não edite à mão).
+
+Uso:
+  house list [--json] [--status STATUS]
+  house describe <id> [--json]
+  house search <termo> [--json]
+  house status [--json]
+  house tui [--plain]
+  house web [id] [--open]
+  house docs [--check]
+  house json
+
+Variáveis:
+  HOUSE_INDEX      caminho do index (default: procura no repo/clones)
+  HOUSE_WEB_BASE   base da URL do /house (default: host local ou tailnet)
+
+Sem dependência externa: só a stdlib. Funciona no Termux e no Linux.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CANDIDATES = [
+    ROOT / "index" / "house.json",
+    Path.home() / "ai-mesh" / "index" / "house.json",
+    Path.home() / "projects" / "ai-mesh" / "index" / "house.json",
+]
+MARK_BEGIN = "<!-- HOUSE:TABLE -->"
+MARK_END = "<!-- /HOUSE:TABLE -->"
+
+
+def resolve_index(explicit: str | None = None) -> Path:
+    for cand in [explicit, os.environ.get("HOUSE_INDEX")] + [str(p) for p in DEFAULT_CANDIDATES]:
+        if cand and Path(cand).is_file():
+            return Path(cand)
+    raise SystemExit(
+        "house: índex não encontrado. Procurei:\n  "
+        + "\n  ".join(str(p) for p in DEFAULT_CANDIDATES)
+        + "\nDefina HOUSE_INDEX=/caminho/index/house.json"
+    )
+
+
+def load(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"house: não consegui ler {path}: {exc}")
+
+
+def entries(doc: dict) -> list[dict]:
+    return list(doc.get("entries") or [])
+
+
+def by_id(doc: dict, ident: str) -> dict:
+    for e in entries(doc):
+        if e.get("id") == ident:
+            return e
+    ids = ", ".join(e.get("id", "?") for e in entries(doc))
+    raise SystemExit(f"house: id '{ident}' não existe. IDs: {ids}")
+
+
+def _s(value, width: int) -> str:
+    text = str(value or "").replace("\n", " ")
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def _last_summary(e: dict) -> str:
+    lm = e.get("last_measured")
+    if not lm:
+        return "— (sem medição)"
+    return lm.get("summary") or lm.get("ts") or "—"
+
+
+def _hosts(e: dict) -> str:
+    return ",".join(e.get("hosts") or []) or "?"
+
+
+def _table(rows: list[list[str]], headers: list[str]) -> str:
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(str(cell)))
+    line = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
+    out = [line, "  ".join("-" * widths[i] for i in range(len(headers)))]
+    for row in rows:
+        out.append("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(row)))
+    return "\n".join(out)
+
+
+def human_entry(e: dict) -> str:
+    entry = e.get("entry") or {}
+    code = e.get("code") or {}
+    lm = e.get("last_measured")
+    docs = e.get("docs") or []
+    lines = [
+        f"{e.get('id')} — {e.get('title')}",
+        f"status: {e.get('status')} · hosts: {_hosts(e)} · tags: {', '.join(e.get('tags') or [])}",
+        "",
+        e.get("summary") or "",
+        "",
+        "Entrypoints",
+        f"  CLI  {entry.get('cli', '—')}",
+        f"  TUI  {entry.get('tui', '—')}",
+        f"  Web  {entry.get('web', '—')}",
+        f"  MCP  {entry.get('mcp', '—')}",
+        "",
+        "Onde está",
+        f"  canônico: {code.get('canonical', '—')}",
+        f"  espelho:  {code.get('mirror', '—')}",
+    ]
+    if docs:
+        lines.append("  docs:")
+        lines += [f"    - {d}" for d in docs]
+    lines += ["", "Saúde", f"  {e.get('health', '—')}", "", "Última medição"]
+    if lm:
+        lines.append(f"  {lm.get('ts', '?')}: {lm.get('summary', '')}")
+        if lm.get("source"):
+            lines.append(f"  fonte: {lm['source']}")
+    else:
+        lines.append("  — (sem medição registrada)")
+    return "\n".join(lines)
+
+
+# ── comandos ────────────────────────────────────────────────────────────────
+
+def cmd_list(doc: dict, args) -> int:
+    items = entries(doc)
+    if args.status:
+        items = [e for e in items if e.get("status") == args.status]
+    if args.json:
+        print(json.dumps(items, ensure_ascii=False, indent=2))
+        return 0
+    rows = [[e.get("id", "?"), e.get("status", "?"), _hosts(e),
+             _s(e.get("title", ""), 44), _s((e.get("entry") or {}).get("cli", ""), 38)]
+            for e in items]
+    print(_table(rows, ["id", "status", "hosts", "título", "CLI"]))
+    print(f"\n{len(items)} domínio(s) · fonte: {args.index_path}")
+    return 0
+
+
+def cmd_describe(doc: dict, args) -> int:
+    e = by_id(doc, args.id)
+    if args.json:
+        print(json.dumps(e, ensure_ascii=False, indent=2))
+    else:
+        print(human_entry(e))
+    return 0
+
+
+def cmd_search(doc: dict, args) -> int:
+    q = args.term.lower()
+    hits = []
+    for e in entries(doc):
+        hay = " ".join([
+            str(e.get("id", "")), str(e.get("title", "")),
+            str(e.get("summary", "")), " ".join(e.get("tags") or []),
+            " ".join(e.get("hosts") or []),
+        ]).lower()
+        if q in hay:
+            hits.append(e)
+    if args.json:
+        print(json.dumps(hits, ensure_ascii=False, indent=2))
+        return 0 if hits else 1
+    if not hits:
+        print(f"house: nada para '{args.term}'", file=sys.stderr)
+        return 1
+    rows = [[e.get("id", "?"), e.get("status", "?"), _s(e.get("title", ""), 50)]
+            for e in hits]
+    print(_table(rows, ["id", "status", "título"]))
+    return 0
+
+
+def cmd_status(doc: dict, args) -> int:
+    if args.json:
+        payload = [{"id": e.get("id"), "status": e.get("status"),
+                    "last_measured": e.get("last_measured")} for e in entries(doc)]
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    rows = [[e.get("id", "?"), e.get("status", "?"), _s(_last_summary(e), 78)]
+            for e in entries(doc)]
+    print(_table(rows, ["id", "status", "última medição"]))
+    bad = [e for e in entries(doc) if e.get("status") not in ("active", "planned")]
+    return 1 if bad else 0
+
+
+def cmd_json(doc: dict, args) -> int:
+    print(json.dumps(doc, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _web_base() -> str:
+    base = os.environ.get("HOUSE_WEB_BASE", "").strip()
+    if base:
+        return base.rstrip("/")
+    # Termux TAMBEM reporta sys.platform == "linux": nao use isso para
+    # distinguir. O proxy do Tailscale serve o hub em /hub, entao o caminho
+    # externo e /hub/house; no Linux local e :8091/house.
+    termux = ("com.termux" in os.environ.get("PREFIX", "")
+              or Path("/data/data/com.termux/files/usr").is_dir())
+    if termux:
+        return "http://nitro-v15.tailbcc368.ts.net/hub"
+    if sys.platform.startswith("linux"):
+        return "http://127.0.0.1:8091"
+    return "http://nitro-v15.tailbcc368.ts.net/hub"
+
+
+def cmd_web(doc: dict, args) -> int:
+    url = _web_base() + "/house"
+    if args.id:
+        by_id(doc, args.id)
+        url += "#" + args.id
+    print(url)
+    if args.open:
+        opener = shutil.which("termux-open-url") or shutil.which("xdg-open")
+        if not opener:
+            print("house: sem opener (termux-open-url/xdg-open); abra a URL acima", file=sys.stderr)
+            return 1
+        subprocess.run([opener, url], check=False)
+    return 0
+
+
+def _doc_md(e: dict) -> str:
+    entry = e.get("entry") or {}
+    code = e.get("code") or {}
+    lm = e.get("last_measured")
+    lines = [
+        f"# {e.get('title')}",
+        "",
+        f"> Volta para [HOME](../../HOME.md) · Fonte: `index/house.json` · "
+        f"Código canônico: `{code.get('canonical', '—')}`",
+        "",
+        f"**Status:** {e.get('status')} · **Hosts:** {_hosts(e)} · "
+        f"**Tags:** {', '.join(e.get('tags') or [])}",
+        "",
+        e.get("summary") or "",
+        "",
+        "## Entrypoints",
+        "",
+        "| canal | comando |",
+        "|---|---|",
+        f"| CLI | `{entry.get('cli', '—')}` |",
+        f"| TUI | `{entry.get('tui', '—')}` |",
+        f"| Web | `{entry.get('web', '—')}` |",
+        f"| MCP | `{entry.get('mcp', '—')}` |",
+        "",
+        "## Onde está",
+        "",
+        f"- Código canônico: `{code.get('canonical', '—')}`",
+        f"- Espelho: `{code.get('mirror', '—')}`",
+    ]
+    for d in (e.get("docs") or []):
+        lines.append(f"- Doc: `{d}`")
+    lines += [
+        "",
+        "## Saúde",
+        "",
+        f"`{e.get('health', '—')}`",
+        "",
+        "## Última medição",
+        "",
+    ]
+    if lm:
+        lines.append(f"{lm.get('ts', '?')} — {lm.get('summary', '')}")
+        if lm.get("source"):
+            lines += ["", f"Fonte: `{lm['source']}`"]
+    else:
+        lines.append("— (sem medição registrada)")
+    return "\n".join(lines) + "\n"
+
+
+def _home_table(doc: dict) -> str:
+    rows = ["| domínio | o que resolve | CLI | web |", "|---|---|---|---|"]
+    for e in entries(doc):
+        summary = str(e.get("summary") or "").replace("|", "\\|")
+        cli = str((e.get("entry") or {}).get("cli") or "—").replace("|", "\\|")
+        web = str((e.get("entry") or {}).get("web") or "—")
+        rows.append(
+            f"| [{e.get('id')}](docs/house/{e.get('id')}.md) | {summary} | `{cli}` | `{web}` |"
+        )
+    return "\n".join(rows)
+
+
+def _plan_docs(doc: dict) -> dict[Path, str]:
+    plan: dict[Path, str] = {}
+    for e in entries(doc):
+        if not e.get("id"):
+            continue
+        plan[ROOT / "docs" / "house" / f"{e['id']}.md"] = _doc_md(e)
+    home = ROOT / "HOME.md"
+    if home.is_file():
+        content = home.read_text(encoding="utf-8")
+        if MARK_BEGIN in content and MARK_END in content:
+            before, rest = content.split(MARK_BEGIN, 1)
+            _, after = rest.split(MARK_END, 1)
+            plan[home] = before + MARK_BEGIN + "\n" + _home_table(doc) + "\n" + MARK_END + after
+    return plan
+
+
+def cmd_docs(doc: dict, args) -> int:
+    plan = _plan_docs(doc)
+    if not plan:
+        print("house: nada para gerar (HOME.md sem marcadores?)", file=sys.stderr)
+        return 1
+    changed = []
+    for path, content in plan.items():
+        old = path.read_text(encoding="utf-8") if path.is_file() else ""
+        if old != content:
+            changed.append(path)
+            if not args.check:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+    if args.check:
+        if changed:
+            print("house docs: desatualizado:")
+            for p in changed:
+                print(f"  {p}")
+            return 1
+        print(f"house docs: OK ({len(plan)} arquivos)")
+        return 0
+    print(f"house docs: {len(changed)} arquivo(s) atualizado(s) de {len(plan)}")
+    return 0
+
+
+def _plain_tui(doc: dict) -> int:
+    items = entries(doc)
+    while True:
+        print("\nCasa — domínios")
+        for i, e in enumerate(items, 1):
+            print(f"  {i:2}. {e.get('id'):12} [{e.get('status'):7}] {_s(e.get('title'), 52)}")
+        try:
+            raw = input("\n> número, 's termo', 'q': ").strip()
+        except EOFError:
+            print()
+            return 0
+        if raw in ("q", "quit", "sair", ""):
+            return 0
+        if raw.startswith("s "):
+            term = raw[2:].lower()
+            for e in items:
+                hay = (str(e.get("id")) + " " + str(e.get("title")) + " " +
+                       " ".join(e.get("tags") or [])).lower()
+                if term in hay:
+                    print(f"\n--- {e.get('id')} ---\n{human_entry(e)}")
+            continue
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(items):
+                print("\n" + human_entry(items[idx]))
+            else:
+                print("fora do intervalo")
+        except ValueError:
+            print("comando inválido")
+
+
+def _dialog_tui(doc: dict) -> int | None:
+    if not shutil.which("dialog"):
+        return None
+    items = entries(doc)
+    args = ["dialog", "--backtitle", "Casa — ai-mesh", "--title", "Domínios",
+            "--menu", "Escolha um domínio (ESC sai)", "0", "0", "0"]
+    for e in items:
+        args += [str(e.get("id")), _s(e.get("title"), 60)]
+    try:
+        r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return 0
+    ident = r.stdout.strip()
+    if not ident:
+        return 0
+    try:
+        e = by_id(doc, ident)
+    except SystemExit:
+        return 0
+    subprocess.run(["dialog", "--title", ident, "--msgbox", human_entry(e), "0", "0"],
+                   stderr=subprocess.DEVNULL, check=False)
+    return _dialog_tui(doc)
+
+
+def cmd_tui(doc: dict, args) -> int:
+    if not args.plain:
+        rc = _dialog_tui(doc)
+        if rc is not None:
+            return rc
+    return _plain_tui(doc)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="house",
+        description="Índice único da casa: lista, descreve e abre domínios sem carregar o repo inteiro.",
+    )
+    p.add_argument("--index", dest="index_path", default=None,
+                   help="caminho do index/house.json (default: auto)")
+    p.add_argument("--version", action="version", version="house 1.0")
+    sub = p.add_subparsers(dest="cmd", required=False)
+
+    q = sub.add_parser("list", help="lista os domínios")
+    q.add_argument("--json", action="store_true")
+    q.add_argument("--status", default="")
+    q.set_defaults(fn=cmd_list)
+
+    q = sub.add_parser("describe", help="detalha um domínio")
+    q.add_argument("id")
+    q.add_argument("--json", action="store_true")
+    q.set_defaults(fn=cmd_describe)
+
+    q = sub.add_parser("search", help="busca por id/título/tag")
+    q.add_argument("term")
+    q.add_argument("--json", action="store_true")
+    q.set_defaults(fn=cmd_search)
+
+    q = sub.add_parser("status", help="status e última medição")
+    q.add_argument("--json", action="store_true")
+    q.set_defaults(fn=cmd_status)
+
+    q = sub.add_parser("tui", help="menu navegável")
+    q.add_argument("--plain", action="store_true", help="força o menu numerado")
+    q.set_defaults(fn=cmd_tui)
+
+    q = sub.add_parser("web", help="URL da página /house")
+    q.add_argument("id", nargs="?")
+    q.add_argument("--open", action="store_true")
+    q.set_defaults(fn=cmd_web)
+
+    q = sub.add_parser("docs", help="gera HOME.md (tabela) e docs/house/*.md")
+    q.add_argument("--check", action="store_true", help="só verifica, não escreve")
+    q.set_defaults(fn=cmd_docs)
+
+    q = sub.add_parser("json", help="imprime o index cru")
+    q.set_defaults(fn=cmd_json)
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    path = resolve_index(args.index_path)
+    doc = load(path)
+    args.index_path = str(path)
+    if not getattr(args, "fn", None):
+        args.fn = cmd_list
+        args.json = False
+        args.status = ""
+    return args.fn(doc, args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

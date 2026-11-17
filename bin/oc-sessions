@@ -1,0 +1,17 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Helper v2: opencode2 não tem subcomando 'session' (removido no v2).
+# Equivalente: opencode2 api GET /api/session
+opencode2 api GET /api/session 2>/dev/null | python3 -c "
+import sys,json,datetime
+d=json.load(sys.stdin)
+print(f\"{'ID':36}  {'Titulo':45}  Atualizado\")
+print('-'*110)
+now=datetime.datetime.now(datetime.timezone.utc)
+for s in d.get('data',[]):
+    upd=datetime.datetime.fromtimestamp(s['time']['updated']/1000, tz=now.tzinfo).astimezone().strftime('%d/%m %H:%M')
+    print(f\"{s['id']:36}  {s.get('title','(sem titulo)')[:45]:45}  {upd}  dir={s.get('location',{}).get('directory','')}\")
+print()
+print('Retomar anterior: opencode2 --session ses_e5318d1edffed5TDOv6O5Lu2qr')
+print('Continuar última: opencode2 --continue')
+print('Atual: opencode2 --session', d['data'][1]['id'] if len(d['data'])>1 else '...')
+"

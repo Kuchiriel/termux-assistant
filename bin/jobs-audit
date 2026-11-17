@@ -1,0 +1,366 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""jobs-audit - audita os jobs do agendador do celular (Termux:API).
+
+    jobs-audit             # mostra a saude de cada job
+    jobs-audit --json      # saida em JSON
+    jobs-audit --check     # sai 1 se algum job estiver QUEBRADO (nao apenas parado)
+    jobs-audit --help
+
+POR QUE (medido 12/11 no celular):
+    O agendador do Termux roda 12 automacoes do celular (heartbeat, night-shift,
+    mesh-repo, publish-inventory, wake-monitor, disk-guard, backup, ...). Cada
+    uma delas e' um script INDEPENDENTE, e eu alterei varios ao longo da noite
+    (phone-fs, heartbeat, mesh-repo, fleet-relatorio, publish-inventory,
+    wake-direct, catalog, catalog-cross). Um job quebrado nao faz barulho: o
+    agendador simplesmente nao roda, e a frota fica em silencio — ou, pior,
+    continua rodando com uma versao antiga (a divergencia entre ~/bin e o repo
+    ja me enganou UMA VEZ hoje: eu testei a copia errada do script).
+
+    Este auditor diz, para cada job: o script existe? e' executavel? passa no
+    teste de sintaxe? o shebang existe no sistema? e ha quanto tempo o proprio
+    script rodou (pelo log)?
+
+So LE: nao roda, nao cancela e nao reagenda nenhum job.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+
+
+def sh(cmd, timeout=30):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.stdout, p.stderr, p.returncode
+    except subprocess.TimeoutExpired:
+        return "", "timeout", 124
+    except Exception as e:
+        return "", str(e), 1
+
+
+def jobs():
+    out, _, _ = sh(["termux-job-scheduler", "-p"], timeout=40)
+    res = []
+    for line in out.splitlines():
+        m = re.match(r"Pending Job (\d+): (\S+)\s+\(periodic: (\d+)ms\)\s+\(persisted\)(.*)", line)
+        if not m:
+            continue
+        jid, path, per, extra = m.group(1), m.group(2), int(m.group(3)), m.group(4)
+        res.append({"id": int(jid), "path": path, "periodo_min": round(per / 60000.0, 1),
+                    "battery_not_low": "battery not low" in extra,
+                    # MEDIDO 13/11: jobs com 'battery not low' sao ADIADOS pelo
+                    # proprio Android quando a bateria esta baixa — nao e' falha.
+                    # Sem isso, o auditor acusava 'ATRASADO' o que era adiamento
+                    # legitimo (falso positivo em auditor = perda de confianca).
+                    "adiado_pela_bateria": "battery not low" in extra})
+    return res
+
+
+def check_script(path):
+    r = {"existe": os.path.isfile(path), "executavel": False, "sintaxe": None,
+         "shebang_ok": None, "detalhe": ""}
+    if not r["existe"]:
+        r["detalhe"] = "script inexistente"
+        return r
+    r["executavel"] = os.access(path, os.X_OK)
+    with open(path, "rb") as fh:
+        first = fh.readline().decode("utf-8", "ignore").strip()
+    if first.startswith("#!"):
+        interp = first[2:].strip().split()[0] if len(first) > 2 else ""
+        r["shebang_ok"] = os.path.exists(interp) if interp.startswith("/") else None
+    ext = path.rsplit(".", 1)[-1] if "." in path else ""
+    if ext == "sh" or first.endswith("bash"):
+        _, err, rc = sh(["bash", "-n", path], timeout=40)
+        r["sintaxe"] = (rc == 0)
+        if rc != 0:
+            r["detalhe"] = err.strip().splitlines()[0][:120] if err.strip() else "bash -n falhou"
+    elif ext == "py" or first.endswith("python3"):
+        _, err, rc = sh([sys.executable, "-m", "py_compile", path], timeout=40)
+        r["sintaxe"] = (rc == 0)
+        if rc != 0:
+            r["detalhe"] = err.strip().splitlines()[-1][:120] if err.strip() else "py_compile falhou"
+    else:
+        r["sintaxe"] = None
+    return r
+
+
+# onde cada job deixa rastro. MEDIDO 12/11: o agendador nao avisa se um job
+# FALHOU — ele simplesmente nao roda de novo. O unico sinal e o proprio rastro
+# do script (log/estado). Sem este mapa, um job quebrado e um job saudavel
+# Parecem IGUAIS na lista do agendador.
+RASTROS = {
+    "heartbeat": ["heartbeat.log", "heartbeat.json"],
+    "night-shift": ["night-shift.log"],
+    "mesh-repo": ["mesh-repo.log"],
+    "mesh-repo-linux": ["mesh-repo-linux.log"],
+    "disk-guard": ["disk-guard.csv"],
+    # MEDIDO 12/11: 5 jobs eram "sem rastro" porque so escrevem log CONDICIONAL
+    # (quando publica / quando falha) — e o agendador nao avisa que rodou. Agora
+    # cada um toca job-<nome>.trace a cada execucao (uma linha: epoch + estado).
+    # Sem isso, "job quebrado" e "job saudavel" ficam IGUAIS na lista do Android.
+    "battery-monitor": ["job-battery-monitor.trace", "battery.csv"],
+    "battery-monitor-job": ["job-battery-monitor.trace", "battery.csv"],
+    "wake-monitor": ["job-wake-monitor.trace", "wake-monitor-last.json"],
+    "publish-inventory": ["inventory/termux.json"],   # relativo ao repo
+    "host-check": ["job-host-check.trace", "host-check.log"],
+    "backup": ["job-backup.trace", "backup.log"],
+    "mesh-sync": ["job-mesh-sync.trace", "mesh-sync.log"],
+    "mesh-apply": ["job-mesh-sync.trace", "mesh-sync.log"],
+    "pendencia-job": ["job-pendencia.trace"],
+    "pendencia": ["job-pendencia.trace"],
+    "fleet-dispatch": ["job-fleet-dispatch.trace", "fleet-dispatch.log"],
+}
+
+
+def ultimo_rastro(nome):
+    """(mtime, caminho) do rastro mais recente do job, ou (None, None)."""
+    melhor = (None, None)
+    for cand in RASTROS.get(nome, []):
+        if "/" in cand:
+            p = os.path.join(os.environ.get("AI_MESH_DIR", os.path.join(HOME, "ai-mesh")), cand)
+        else:
+            p = os.path.join(HOME, ".local/state", cand)
+        if not os.path.isfile(p):
+            continue
+        mt = os.path.getmtime(p)
+        if melhor[0] is None or mt > melhor[0]:
+            melhor = (mt, p)
+    return melhor
+
+
+def check_scripts_bin():
+    """Todos os scripts do ~/bin: o shebang RESOLVE? e a sintaxe passa?
+
+    MEDIDO 13/11: 15 scripts do ~/bin estavam com '#!/usr/bin/env python3' e
+    NAO EXECUTAVAM — o Termux nao tem /usr/bin/env e o handler binfmt do
+    Android nao estava registrado. Entre os quebrados: phone-fs (o acesso da
+    frota aos arquivos do celular) e nv-gate-phone (o gateway de modelo) —
+    ou seja, file access e modelo DOWN, e NINGUEM notou (o job falhava em
+    silencio). A regra: RUNTIME (~/bin) usa o shebang do Termux; REPO
+    (shared/scripts) usa o portavel, porque o Linux tem /usr/bin/env.
+    """
+    quebrados = []
+    try:
+        nomes = sorted(os.listdir(os.path.join(HOME, "bin")))
+    except Exception:
+        return quebrados
+    for nome in nomes:
+        if nome.endswith(".pyc"):
+            continue
+        p = os.path.join(HOME, "bin", nome)
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, "rb") as fh:
+                primeira = fh.readline().decode("utf-8", "ignore").strip()
+        except Exception:
+            continue
+        if not primeira.startswith("#!"):
+            continue
+        interp = primeira[2:].strip().split()[0] if len(primeira) > 2 else ""
+        if interp.startswith("/") and not os.path.exists(interp):
+            quebrados.append((nome, interp))
+    return quebrados
+
+
+def check_drift_repo():
+    """O repo (shared/scripts) esta ATRASADO em relacao ao celular?
+
+    MEDIDO 13/11: o 'notify' com a correcao anti-flood (a gaveta do dono com
+    ~40 notificacoes empilhadas) estava SO no runtime do celular; o repo
+    continuava com o defeito — ou seja, o outro host da frota continuava com
+    o bug. O mesmo com o 'owner-brief' (que parou de mandar o dono LIGAR O PC
+    quando o PC esta de pe e so a ROTA caiu) e o 'caso-busca' (filtro por
+    pasta tematica).
+
+    O repo e' a fonte compartilhada; se a runtime tem correcao que o repo nao
+    tem, a frota inteira (menos o celular) roda a versao velha. Este check
+    compara os dois ignorando o shebang (que por design difere: runtime =
+    Termux, repo = portavel).
+    """
+    repo = os.path.join(os.environ.get("AI_MESH_DIR", os.path.join(HOME, "ai-mesh")),
+                        "shared/scripts")
+    atrasados = []
+    try:
+        nomes = sorted(os.listdir(repo))
+    except Exception:
+        return atrasados
+    for nome in nomes:
+        rp = os.path.join(repo, nome)
+        bp = os.path.join(HOME, "bin", nome)
+        if not (os.path.isfile(rp) and os.path.isfile(bp)):
+            continue
+        try:
+            with open(rp, encoding="utf-8", errors="ignore") as fh:
+                rl = fh.readlines()
+            with open(bp, encoding="utf-8", errors="ignore") as fh:
+                bl = fh.readlines()
+        except Exception:
+            continue
+        if len(rl) > 1 and len(bl) > 1:      # ignora a 1a linha (shebang)
+            rl = rl[1:]
+            bl = bl[1:]
+        if rl != bl:
+            atrasados.append((nome, len(bl) - len(rl)))
+    return atrasados
+
+
+def check_manifest_jobs(js):
+    """Compara IDs agendados com os declarados no manifesto do Termux."""
+    base = os.environ.get("AI_MESH_DIR", os.path.join(HOME, "ai-mesh"))
+    path = os.path.join(base, "manifests", "termux.json")
+    agendados = sorted(int(j["id"]) for j in js)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        declarados = sorted(int(j["id"]) for j in data.get("jobs") or [])
+        erro = None
+    except Exception as exc:
+        declarados = []
+        erro = str(exc)
+    ausentes = sorted(set(agendados) - set(declarados))
+    extras = sorted(set(declarados) - set(agendados))
+    return {"manifest_path": path, "agendador_jobs": agendados,
+            "manifest_jobs": declarados, "ausentes_no_manifesto": ausentes,
+            "extras_no_manifesto": extras, "drift": bool(ausentes or extras or erro),
+            "erro": erro}
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--help", "-h", action="store_true")
+    a = ap.parse_args()
+    if a.help:
+        print(__doc__)
+        return 0
+
+    js = jobs()
+    manifest_drift = check_manifest_jobs(js)
+    rows = []
+    quebrados = 0
+    atrasados = 0
+    adiados = 0
+    agora = __import__("time").time()
+    for j in js:
+        c = check_script(j["path"])
+        quebra = (not c["existe"]) or (c["sintaxe"] is False) or (c["shebang_ok"] is False)
+        nome = os.path.basename(j["path"])
+        mt, rastro = ultimo_rastro(nome)
+        if mt:
+            atraso_min = (agora - mt) / 60.0
+            # atrasado = mais de 2,5 periodos sem rastro novo
+            atrasado = atraso_min > (j["periodo_min"] * 2.5)
+            c["ultima_execucao_min"] = round(atraso_min, 1)
+            c["rastro"] = os.path.basename(rastro)
+        else:
+            atraso_min = None
+            atrasado = False
+            c["ultima_execucao_min"] = None
+            c["rastro"] = None
+        # MEDIDO 13/11: job com 'battery not low' e' ADIADO pelo proprio Android
+        # quando a bateria esta baixa — nao e' falha. Sem isso, o auditor acusava
+        # 'ATRASADO' o que era adiamento legitimo (falso positivo em auditor =
+        # o agente para de confiar na ferramenta).
+        adiado = bool(j.get("adiado_pela_bateria") and atrasado)
+        if adiado:
+            atrasado = False
+            adiados += 1
+        if quebra:
+            quebrados += 1
+        if atrasado:
+            atrasados += 1
+        rows.append(dict(j, **c, quebrado=quebra, atrasado=atrasado, adiado=adiado))
+
+    # shebangs de TODOS os scripts do ~/bin (nao so os dos jobs)
+    bad_bin = check_scripts_bin()
+
+    # MEDIDO 13/11: 6 jobs "atrasados" com o MESMO intervalo (~50 min) nao sao
+    # 6 falhas: e' uma PAUSA DO SISTEMA (o Android suspender o app em doze/suspend
+    # quando a tela apaga). So se conta como atraso real o job que nao se
+    # alinha com a pausa comum.
+    late_rows = [r for r in rows if r.get("atrasado") and r.get("ultima_execucao_min")]
+    pausa = 0
+    if len(late_rows) >= 3:
+        gaps = sorted(r["ultima_execucao_min"] for r in late_rows)
+        mediana = gaps[len(gaps) // 2]
+        alinhados = [r for r in late_rows if abs(r["ultima_execucao_min"] - mediana) <= 5]
+        if len(alinhados) >= 3:
+            pausa = int(mediana)
+            for r in alinhados:
+                r["atrasado"] = False
+                r["pausa_do_sistema"] = True
+            atrasados -= len(alinhados)
+            adiados += len(alinhados)
+
+    drift = check_drift_repo()
+    if a.json:
+        # MEDIDO 17/11: este modo emitia DOIS documentos JSON. jq aceitava o
+        # stream, mas consumidores que leem .jobs no primeiro objeto recebiam
+        # null porque o segundo documento era o detalhe do shebang/drift.
+        payload = {
+            "ts": __import__("datetime").datetime.now().isoformat(),
+            "jobs": len(rows), "quebrados": quebrados, "atrasados": atrasados,
+            "adiados_pela_bateria": adiados, "pausa_do_sistema_min": pausa,
+            "detalhe": rows,
+            "scripts_bin_com_shebang_quebrado": len(bad_bin),
+            "detalhe_bin": bad_bin,
+            "repo_atrasado_vs_celular": drift,
+            "manifest_jobs_drift": manifest_drift,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=1))
+    else:
+        print("%-5s %-9s %-7s %-6s %-6s %-10s %s" % ("job", "periodo", "existe", "exec", "sint", "ultimo(min)", "script"))
+        for r in rows:
+            print("%-5d %-9s %-7s %-6s %-6s %-10s %s%s%s%s%s" % (
+                r["id"], "%s min" % r["periodo_min"], r["existe"], r["executavel"],
+                r["sintaxe"] if r["sintaxe"] is not None else "-",
+                r["ultima_execucao_min"] if r["ultima_execucao_min"] is not None else "sem rastro",
+                os.path.basename(r["path"]),
+                "  <-- QUEBRADO: %s" % r["detalhe"] if r["quebrado"] else "",
+                "  <-- ATRASADO" if r["atrasado"] else "",
+                "  (adiado pela bateria, por desenho)" if r.get("adiado") else "",
+                "  (pausa do sistema: doze/suspend)" if r.get("pausa_do_sistema") else ""))
+        print()
+        print("jobs: %d | QUEBRADOS: %d | ATRASADOS: %d | adiados pela bateria: %d%s"
+              % (len(rows), quebrados, atrasados, adiados,
+                 " | pausa do sistema: %d min" % pausa if pausa else ""))
+        if not quebrados and not atrasados:
+            print("nenhum job quebrado ou atrasado (os adiados pela bateria e a pausa do sistema sao comportamento esperado do Android).")
+        print()
+        print("scripts do ~/bin com shebang que nao resolve: %d" % len(bad_bin))
+        for n, i in bad_bin[:20]:
+            print("  QUEBRADO: %s (shebang %s)" % (n, i))
+        if not bad_bin:
+            print("  todos os scripts do ~/bin tem shebang que resolve neste aparelho.")
+        print()
+        print("scripts do REPO (shared/scripts) que estao atrasados em relacao ao celular: %d"
+              % len(drift))
+        for n, d in drift[:20]:
+            print("  ATRASADO: %s (%+d linhas no celular)" % (n, d))
+        if not drift:
+            print("  repo e runtime estao em dia (fora o shebang, que difere por design).")
+        print()
+        md = manifest_drift
+        print("jobs do manifesto vs agendador: drift=%s" % ("SIM" if md["drift"] else "NAO"))
+        if md["ausentes_no_manifesto"]:
+            print("  AUSENTES NO MANIFESTO: %s" % ", ".join(map(str, md["ausentes_no_manifesto"])))
+        if md["extras_no_manifesto"]:
+            print("  EXTRAS NO MANIFESTO: %s" % ", ".join(map(str, md["extras_no_manifesto"])))
+        if md.get("erro"):
+            print("  ERRO AO LER MANIFESTO: %s" % md["erro"])
+        if not md["drift"]:
+            print("  manifesto declara exatamente os jobs agendados.")
+
+    if a.check:
+        return 1 if (quebrados or atrasados or bad_bin or drift) else 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

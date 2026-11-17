@@ -1,0 +1,12 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# widget: campo de TEXTO + roteador (funciona sem rede nas rotas locais/offline)
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+if ! command -v termux-dialog >/dev/null 2>&1; then
+  printf 'Termux:API ausente'; exit 1
+fi
+raw=$(termux-dialog text -i "Pergunta (texto)" -t "Crouton" 2>/dev/null)
+q=$(printf '%s' "$raw" | jq -r '.text // empty' 2>/dev/null)
+[ -z "$q" ] && { printf '(sem texto)'; exit 0; }
+printf 'Q: %s\n\n' "$q"
+timeout 130 ~/bin/assistant-router --route "$q" 2>/dev/null | head -c 900

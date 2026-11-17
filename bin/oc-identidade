@@ -1,0 +1,152 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# oc-identidade - descobre dinamicamente qual OpenCode roda a sessao atual e
+# qual o MODELO desta sessao. Nada fixo: o modelo muda entre as sessoes.
+#
+#   oc-identidade             # mostra tudo
+#   oc-identidade --json      # saida em JSON
+#   OC_IDENTIDADE_OFFLINE=1 oc-identidade --json  # sem rede (model.json local)
+#   oc-identidade --all       # tambem sonda o opencode2 (API V1, so para debug)
+#
+# Como funciona:
+#   1) pega o id da sessao (env OPENCODE_SESSION_ID ou processo pai do agente);
+#   2) pergunta a CADA servico opencode da maquina qual sessao ele possui
+#      (via a CLI, que ja tem o contexto de autenticacao do servico);
+#   3) o que responder com a sessao atual e o meu servidor; dele vem o modelo.
+#
+# Exemplo de saida:
+#   sessao    : ses_e528...
+#   meu server: http://127.0.0.1:52031
+#   MODELO    : minimaxai/minimax-m3.1-flash
+#   provider  : nvidia
+#   variante  : thinking
+
+set -uo pipefail
+
+# flags: --json  --offline  --all  (--all tambem via OC_IDENTIDADE_ALL=1)
+JSON=0; OFFLINE="${OC_IDENTIDADE_OFFLINE:-0}"; ALL="${OC_IDENTIDADE_ALL:-0}"
+for a in "$@"; do
+  case "$a" in
+    --json) JSON=1 ;;
+    --offline) OFFLINE=1 ;;
+    --all) ALL=1 ;;
+    --help|-h) echo "uso: oc-identidade [--json] [--offline] [--all]"; exit 0 ;;
+  esac
+done
+TIMEOUT="${OC_IDENTIDADE_TIMEOUT:-8}"
+
+SID="${OPENCODE_SESSION_ID:-}"
+if [[ -z "$SID" ]]; then
+  ppid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')
+  for p in $ppid $(ps -o ppid= -p "$ppid" 2>/dev/null | tr -d ' '); do
+    s=$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -m1 '^OPENCODE_SESSION_ID=' | cut -d= -f2-)
+    [[ -n "$s" ]] && SID="$s" && break
+  done
+fi
+
+# modo offline: sem servidor, so o estado local do ultimo modelo
+if [[ "$OFFLINE" == "1" ]]; then
+  out=$(python3 -c '
+import json,os
+sid=os.environ.get("OPENCODE_SESSION_ID","")
+try:
+    d=json.load(open(os.path.expanduser("~/.local/state/opencode/model.json")))
+    r=(d.get("recent") or [{}])[0]
+    prov=r.get("providerID",""); mid=r.get("modelID","")
+    var=(d.get("variant") or {}).get(f"{prov}/{mid}","")
+    print(json.dumps({"session":sid,"server":"offline","version":"","model":mid,"provider":prov,"variant":var}))
+except Exception:
+    print(json.dumps({"session":sid,"server":"offline","version":"","model":"","provider":"","variant":""}))
+')
+  if [[ "$JSON" == "1" ]]; then printf '%s\n' "$out"; exit 0; fi
+  python3 -c "import json,sys;d=json.loads(sys.argv[1]);print('\033[1mCrouton Alpha\033[0m - identidade (offline)\n  sessao    : %s\n  MODELO    : %s/%s (%s)' % (d['session'] or 'desconhecida', d['provider'] or '?', d['model'] or '?', d['variant'] or '-'))" "$out"
+  exit 0
+fi
+
+# servidores candidatos (opencode2 so com --all: ele fala API V1 e suja o log)
+SERVERS=()
+if [[ "$ALL" == "1" ]]; then
+  for u in $(timeout "$TIMEOUT" opencode service status 2>/dev/null) $(timeout "$TIMEOUT" opencode2 service status 2>/dev/null); do
+    [[ "$u" =~ ^http:// ]] && SERVERS+=("$u")
+  done
+else
+  u=$(timeout "$TIMEOUT" opencode service status 2>/dev/null | grep -m1 http)
+  [[ "$u" =~ ^http:// ]] && SERVERS+=("$u")
+fi
+[[ ${#SERVERS[@]} -eq 0 ]] && SERVERS=("http://127.0.0.1:52031")
+[[ "$ALL" == "1" ]] && SERVERS+=("http://127.0.0.1:28570")
+
+campo() {  # campo <json> <chave>
+  python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin); d=d.get('data',d) if isinstance(d,dict) else d
+    m=(d.get('model') or {}) if isinstance(d,dict) else {}
+    print(m.get('$1') or '')
+except Exception:
+    pass" 2>/dev/null
+}
+
+meu=""; modelo=""; provider=""; variant=""; sessao_id="$SID"; versao=""
+
+# caminho 1: o servico gerenciado desta CLI (sem --server) - é o mais simples
+if [[ -n "$SID" ]]; then
+  s=$(timeout "$TIMEOUT" opencode api GET "/api/session/$SID" 2>/dev/null)
+  if printf '%s' "$s" | grep -q "\"id\":\"$SID\""; then
+    meu="servico-gerenciado"
+    s="$s"
+  fi
+fi
+
+# caminho 2: identifica a PORTA do servidor usando a senha do registro de servico
+if [[ -z "$meu" ]]; then
+  for f in "$HOME/.config/opencode/service-stable.json" "$HOME/.config/opencode/service-android-termux.json"; do
+    [[ -f "$f" ]] || continue
+    pw=$(python3 -c "import json;print(json.load(open('$f')).get('password',''))" 2>/dev/null)
+    [[ -z "$pw" ]] && continue
+    for u in "${SERVERS[@]}"; do
+      out=$(OPENCODE_PASSWORD="$pw" timeout "$TIMEOUT" opencode api GET "/api/session/${SID:-x}" --server "$u" 2>/dev/null)
+      if [[ -n "$SID" ]] && printf '%s' "$out" | grep -q "\"id\":\"$SID\""; then
+        meu="$u"; s="$out"; break 2
+      fi
+    done
+  done
+fi
+
+# caminho 3: sem sessao conhecida -> a mais recente do servico gerenciado
+if [[ -z "$meu" ]]; then
+  s2=$(timeout "$TIMEOUT" opencode api GET "/api/session" 2>/dev/null)
+  sid2=$(printf '%s' "$s2" | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin); a=d.get('data') or d
+    a=sorted(a,key=lambda x:(x.get('time') or {}).get('updated') or 0,reverse=True)
+    print(a[0].get('id','') if a else '')
+except Exception: pass" 2>/dev/null)
+  if [[ -n "$sid2" ]]; then
+    sessao_id="$sid2"; meu="servico-gerenciado"
+    s=$(timeout "$TIMEOUT" opencode api GET "/api/session/$sid2" 2>/dev/null)
+  fi
+fi
+
+if [[ -n "$meu" ]]; then
+  modelo=$(printf '%s' "$s" | campo id)
+  provider=$(printf '%s' "$s" | campo providerID)
+  variant=$(printf '%s' "$s" | campo variant)
+  versao=$(timeout "$TIMEOUT" opencode api GET "/api/health" --server "$meu" 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+fi
+
+if [[ "$JSON" == "1" ]]; then
+  printf '{"session":"%s","server":"%s","version":"%s","model":"%s","provider":"%s","variant":"%s"}\n' \
+    "$sessao_id" "$meu" "$versao" "$modelo" "$provider" "$variant"
+  exit 0
+fi
+
+printf '\033[1mCrouton Alpha\033[0m - identidade dinamica\n'
+printf '  sessao    : %s\n' "${sessao_id:-desconhecida}"
+printf '  meu server: %s%s\n' "${meu:-nao achei}" "${versao:+ (v$versao)}"
+printf '  MODELO    : %s\n' "${modelo:-?}"
+printf '  provider  : %s\n' "${provider:-?}"
+printf '  variante  : %s\n' "${variant:-?}"
+echo ""
+echo "  nome de apresentacao: Crouton Alpha (fixo)"
+echo "  MODELO: dinamico por sessao - NAO fixar no AGENTS.md, use este script."

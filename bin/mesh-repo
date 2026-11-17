@@ -1,0 +1,103 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# mesh-repo - sync do celular com o hub ai-mesh (repo privado da frota).
+#
+#   mesh-repo pull      # git pull + instala as skills compartilhadas
+#   mesh-repo publish   # gera meu manifesto e abre PR no repo
+#   mesh-repo status    # estado do clone + quantas skills/sincronizadas
+#
+# Credencial: usa o token do gh ja autenticado no aparelho (NUNCA no repo).
+
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+
+REPO="https://github.com/Kuchiriel/ai-mesh.git"
+DIR="${AI_MESH_DIR:-$HOME/ai-mesh}"
+HOST="${MESH_HOSTNAME:-termux}"
+LOG="$HOME/.local/state/mesh-repo.log"
+mkdir -p "$(dirname "$LOG")"
+
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG" >/dev/null; }
+
+cmd_pull() {
+  # MEDIDO 12/11: o repo NUNCA chegava no Linux (o ~/ai-mesh de la era um
+  # diretorio do home-repo, sem remote, com so catalogo/ e 3,5 dias parado).
+  # Entreguei um clone em ~/projects/ai-mesh e, na manha seguinte, ele ja estava
+  # 3 commits atrasado: entrega uma vez nao e' canal, e' presente. Como o
+  # CELULAR e' o no que tem o SSH e o repo na mao, ele dispara o pull do Linux
+  # (pull SO, com --ff-only: se o Linux tiver commit local, o pull RECUSA).
+  # FICA NO TOPO de proposito: o clone do Linux pode estar atrasado mesmo quando
+  # o origin nao mudou (pull anterior falhou, ou alguem mexeu no clone) — e o
+  # 'origin sem mudanca -> return' abaixo cortaria a sincronizacao do Linux.
+  # O celular nunca trava por causa disso: o helper registra e devolve 0.
+  if [ -x "$HOME/bin/mesh-repo-linux" ]; then
+    timeout 120 "$HOME/bin/mesh-repo-linux" 2>&1 | tail -1 | sed 's/^/  linux: /'
+  fi
+  if [ ! -d "$DIR/.git" ]; then
+    log "clonando $REPO"
+    git clone --depth 5 "$REPO" "$DIR" || { echo "falha no clone"; return 1; }
+  else
+    # MEDIDO 11/11 (07:30): o pull roda no night-shift a cada 15 min e custa
+    # 4,4 s MEDIDOS (fetch + pull + install-skills), mesmo quando o origin NAO
+    # mudou nada (medido: fetch --dry-run nao trouxe nenhuma referencia nova).
+    # Com a bateria do celular em 6% (unico no de pe), pagar 4,4 s de rede a
+    # cada 15 min para descobrir 'nada mudou' e' desperdicio.
+    # Agora: se o origin nao tem nada novo, o pull e' pulado (e o log diz).
+    # A instalacao das skills tambem so' roda quando houve mudanca real.
+    local _antes _depois _novo=0
+    _antes=$(cd "$DIR" && git rev-parse HEAD 2>/dev/null || echo "")
+    (cd "$DIR" && git fetch --depth 20 origin >/dev/null 2>&1)
+    _depois=$(cd "$DIR" && git rev-parse origin/HEAD 2>/dev/null || git rev-parse origin/main 2>/dev/null || echo "")
+    if [ -n "$_antes" ] && [ -n "$_depois" ] && [ "$_antes" = "$_depois" ]; then
+      log "pull: origin sem mudanca (HEAD $_antes) - pulado (economia de rede/bateria)"
+      echo "sync: nada novo no origin (pull pulado)"
+      return 0
+    fi
+    # MEDIDO 12/11: 'git pull --rebase' FALHA com a arvore suja ("cannot pull
+    # with rebase: You have unstaged changes") — e a arvore do celular esta
+    # quase sempre suja: data/curva-noite.json e' reescrito pelo job a cada
+    # ciclo. Resultado MEDIDO: 220 linhas de 'pull falhou (conflito?)' no log
+    # entre 03:13 e 04:23, e o fallback (git pull -q) falha pelo MESMO motivo
+    # (so mudava a mensagem). Ou seja: commit publicado por OUTRO host nao
+    # chegava ao celular. Agora: rebase.autoStash empilha a alteracao local,
+    # puxa e restaura — o arquivo sujo do job continua como estava.
+    (cd "$DIR" && git -c rebase.autoStash=true pull --rebase -q) || {
+      log "pull falhou (conflito real?); tentando merge"
+      (cd "$DIR" && git -c rebase.autoStash=true pull -q 2>/dev/null) || log "repo local desatualizado"
+    }
+    _novo=1
+  fi
+  local n
+  n=$(bash "$DIR/scripts/install-skills.sh" 2>/dev/null | tail -1)
+  echo "sync: $n"
+  # mostra o que mudou de novo
+  if [ -d "$DIR/memory/episodic" ]; then
+    local novos
+    novos=$(find "$DIR/memory/episodic" -name "*.jsonl" -newer "$HOME/.local/state/mesh-repo.log" 2>/dev/null | wc -l | tr -d ' ')
+    [ "$novos" != "0" ] && echo "  memoria nova de outros hosts: $novos arquivo(s)"
+  fi
+}
+
+cmd_publish() {
+  mkdir -p "$HOME/.config/ai-mesh"
+  ~/bin/mesh-manifest --out "$HOME/.config/ai-mesh/manifest.json" >/dev/null
+  bash "$DIR/scripts/publish-manifest.sh" "$HOST" "$HOME/.config/ai-mesh/manifest.json"
+}
+
+cmd_status() {
+  if [ -d "$DIR/.git" ]; then
+    echo "clone: $DIR"
+    (cd "$DIR" && echo "  branch: $(git branch --show-current) | HEAD: $(git rev-parse --short HEAD) | commits: $(git rev-list --count HEAD)")
+    echo "  skills no repo : $(ls "$DIR/skills" 2>/dev/null | wc -l | tr -d ' ')"
+    echo "  manifests      : $(ls "$DIR/manifests" 2>/dev/null | wc -l | tr -d ' ')"
+    echo "  memoria (linhas): $(cat "$DIR"/memory/episodic/*.jsonl 2>/dev/null | wc -l | tr -d ' ')"
+  else
+    echo "sem clone em $DIR (rode: mesh-repo pull)"
+  fi
+}
+
+case "${1:-pull}" in
+  pull) cmd_pull ;;
+  publish) cmd_publish ;;
+  status) cmd_status ;;
+  *) echo "uso: $0 {pull|publish|status}"; exit 2 ;;
+esac
