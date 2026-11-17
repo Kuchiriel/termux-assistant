@@ -163,10 +163,19 @@ def answer(q):
         elif any(k in ql for k in ("queimad", "burn")):
             domain_ok = any(k in sl for k in ("queimad", "burn", "calor", "pele"))
         elif any(k in ql for k in ("engasg", "chok")):
-            domain_ok = any(k in sl for k in ("engasg", "chok", "asfix", "golpes", "escápul"))
+            domain_ok = any(k in sl for k in ("engasg", "chok", "asfix"))
+            if domain_ok and any(k in ql for k in ("bebe", "bebê", "infant", "crianca")):
+                domain_ok = ("beb" in sl or "infant" in sl or "crianc" in sl) and \
+                            any(k in sl for k in ("golp", "palmad", "escápul", "escapul", "costas")) and \
+                            "boca a boca" not in sl
         elif any(k in ql for k in ("sangr", "ferida", "bleed")):
             domain_ok = any(k in sl for k in ("sangr", "ferida", "bleed", "press", "torniq"))
-        if overlap >= 0.18 and not unsupported_nums and domain_ok:
+        # gate de IDIOMA: resposta de sobrevivencia tem de ser PT. Se a linha
+        # nao tem nenhum acento PT e tem palavras inglesas tipicas, descarta.
+        en_words = sum(1 for w in ("The", "water", "described", "treatment", "source", "health", "store", "bottled") if w.lower() in sl)
+        pt_marks = len(re.findall(r"[áéíóúãõêôç]", sl))
+        lang_ok = pt_marks > 0 or en_words == 0
+        if overlap >= 0.18 and not unsupported_nums and domain_ok and lang_ok:
             kept.append(s)
         else:
             duvidosos.append(s)
