@@ -23,7 +23,9 @@ def translate(sentence: str) -> str:
              "literalmente, sem explicar, sem inventar numeros ou termos. "
              "Mantenha numeros e unidades exatamente como estao.")
     cmd = [CLI, "-m", str(M), "-sys", sys_p, "-p", sentence, "--ctx-size", "1024",
-           "-st", "-n", "100", "--no-warmup", "-t", "4", "--no-display-prompt"]
+           "-st", "-n", "100", "--no-warmup", "-t", "4", "--no-display-prompt",
+           "--temp", "0.1", "--top-k", "20", "--top-p", "0.9", "--min-p", "0.05",
+           "--typical-p", "0.9", "--seed", "42"]
     proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -40,6 +42,23 @@ def translate(sentence: str) -> str:
         nums_in = re.findall(r"\b\d+(?:[.,]\d+)?\b", sentence)
         nums_out = re.findall(r"\b\d+(?:[.,]\d+)?\b", out)
         if sorted(nums_in) != sorted(nums_out): return sentence + " [traducao rejeitada: numeros divergem]"
+        # gate de TERMOS: conceitos-chave da fonte precisam sobreviver a traducao.
+        # Mapa PT->EN inverted: se a fonte tem o termo EN, a saida PT deve ter o equivalente.
+        REQ = {
+            "back slaps": ("palmad", "golp", "batidas"),
+            "shoulder blades": ("escápul", "escapul", "omoplat"),
+            "chest": ("peito", "tórax", "torax"),
+            "pressure": ("press", "compress"),
+            "immobilization": ("imobiliz", "imobil"),
+            "boil": ("ferv", "ebuli"),
+            "water": ("agua", "água"),
+            "burn": ("queimad", "queimadura"),
+            "wound": ("ferida", "ferimento"),
+        }
+        low = out.lower(); src = sentence.lower()
+        for en, pts in REQ.items():
+            if en in src and not any(k in low for k in pts):
+                return sentence + f" [traducao rejeitada: termo '{en}' perdido]"
         return out[:600] or sentence
     except Exception:
         if proc is not None and proc.poll() is None:

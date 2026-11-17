@@ -83,8 +83,10 @@ def generate(q, ctx):
     if not MODEL.is_file():
         return None
     cmd = [CLI, "-m", str(MODEL), "-sys", system + "\n\nFONTES:\n" + ctx,
-           "-p", q, "--ctx-size", "2048", "-st", "-n", "220", "--no-warmup",
-           "-t", "4", "--no-display-prompt"]
+           "-p", q, "--ctx-size", "2048", "-st", "-n", os.environ.get("TA_SLM_N", "220"), "--no-warmup",
+           "-t", "4", "-tb", "8", "--no-display-prompt",
+           "--temp", "0.1", "--top-k", "20", "--top-p", "0.9", "--min-p", "0.05",
+           "--typical-p", "0.9", "--seed", "42"]
     proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -180,9 +182,15 @@ def answer(q):
             domain_ok = any(k in sl for k in ("sangr", "ferida", "bleed", "press", "torniq"))
         # gate de IDIOMA: resposta de sobrevivencia tem de ser PT. Se a linha
         # nao tem nenhum acento PT e tem palavras inglesas tipicas, descarta.
-        en_words = sum(1 for w in ("The", "water", "described", "treatment", "source", "health", "store", "bottled") if w.lower() in sl)
+        en_words = sum(1 for w in ("the", "and", "for", "with", "should", "check",
+                                    "water", "source", "store", "bottled", "expiration",
+                                    "replace", "needed", "described", "treatment") if w in sl)
         pt_marks = len(re.findall(r"[áéíóúãõêôç]", sl))
         lang_ok = pt_marks > 0 or en_words == 0
+        # dominio AGUA: a linha precisa falar de agua/tratamento, nao validade
+        if lang_ok and any(k in ql for k in ("agua", "purificar", "beber", "rio")):
+            lang_ok = any(k in sl for k in ("agua", "água", "purif", "ferv", "filtr",
+                                            "cloro", "destil", "beb", "water"))
         if overlap >= 0.18 and not unsupported_nums and domain_ok and lang_ok:
             kept.append(s)
         else:
