@@ -12,7 +12,7 @@ check opencode-config "$HOME_DIR/.config/opencode"
 check offline-corpus "$HOME_DIR/offline-corpus"
 check env-example "$HOME_DIR/.config/termux-assistant/.env.example"
 check ta-cli "$HOME_DIR/bin/ta"
-atalhos=$(find "$HOME_DIR/.shortcuts" -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' ')
+atalhos=$(find "$HOME_DIR/.shortcuts" -maxdepth 1 -type f -name 'crouton-*' 2>/dev/null | wc -l | tr -d ' ')
 printf 'atalhos em ~/.shortcuts: %s\n' "$atalhos"
 [ "$atalhos" -ge 5 ] || FALHAS=$((FALHAS+1))
 # segredo: so caminhos no .env
