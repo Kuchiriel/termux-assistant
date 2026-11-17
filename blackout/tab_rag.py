@@ -85,14 +85,22 @@ def generate(q, ctx):
     cmd = [CLI, "-m", str(MODEL), "-sys", system + "\n\nFONTES:\n" + ctx,
            "-p", q, "--ctx-size", "2048", "-st", "-n", "220", "--no-warmup",
            "-t", "4", "--no-display-prompt"]
+    proc = None
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        out = p.stdout or ""
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            stdout, _ = proc.communicate(timeout=240)
+        except subprocess.TimeoutExpired:
+            proc.kill(); proc.communicate()
+            return None
+        out = stdout or ""
         marks = [l for l in out.splitlines() if l.lstrip().startswith("> ")]
         if marks: out = out.rsplit(marks[-1], 1)[1]
         out = re.split(r"\[ Prompt:|Exiting", out)[0].strip()
         return out[:2000] or None
     except Exception:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
         return None
 
 

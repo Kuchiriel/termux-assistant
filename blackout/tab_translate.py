@@ -24,9 +24,16 @@ def translate(sentence: str) -> str:
              "Mantenha numeros e unidades exatamente como estao.")
     cmd = [CLI, "-m", str(M), "-sys", sys_p, "-p", sentence, "--ctx-size", "1024",
            "-st", "-n", "100", "--no-warmup", "-t", "4", "--no-display-prompt"]
+    proc = None
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        out = p.stdout or ""
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            stdout, _ = proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            return sentence + " [traducao abortada por timeout]"
+        out = stdout or ""
         marks = [l for l in out.splitlines() if l.lstrip().startswith("> ")]
         if marks: out = out.rsplit(marks[-1], 1)[1]
         out = re.split(r"\[ Prompt:|Exiting", out)[0].strip()
@@ -35,6 +42,8 @@ def translate(sentence: str) -> str:
         if sorted(nums_in) != sorted(nums_out): return sentence + " [traducao rejeitada: numeros divergem]"
         return out[:600] or sentence
     except Exception:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
         return sentence
 
 
