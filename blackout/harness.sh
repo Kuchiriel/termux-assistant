@@ -32,9 +32,11 @@ if [ -n "${TA_LOCAL_MODEL_URL:-}" ]; then
   [ -n "$R" ] && { printf '%s\n' "$R"; exit 0; }
 fi
 
-# 3) corpus offline
-if [ -x "${TA_OFFLINE_BIN:-$HOME/bin/offline}" ]; then
-  R=$(timeout 40 "${TA_OFFLINE_BIN:-$HOME/bin/offline}" "$Q" -k 2 2>/dev/null)
+# 3) corpus offline com resposta direta (extracao + fonte)
+ANSWER="$HOME/projects/termux-assistant/blackout/offline_answer.py"
+[ -f "$ANSWER" ] || ANSWER="$HOME/.local/share/termux-assistant/blackout/offline_answer.py"
+if [ -f "$ANSWER" ]; then
+  R=$(timeout 40 python3 "$ANSWER" "$Q" 2>/dev/null)
   [ -n "$R" ] && { printf '%s\n' "$R"; exit 0; }
 fi
 
