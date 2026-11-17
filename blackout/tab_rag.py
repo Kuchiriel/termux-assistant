@@ -24,6 +24,12 @@ EXP = {"agua": "water purifying purification distillation", "purificar": "purify
        "crianca": "child infant baby", "criancas": "children infant baby",
        "palmadas": "back slaps", "escapulas": "shoulder blades", "coluna": "spine",
        "hemorragia": "bleeding", "parada": "cardiac arrest cpr", "massagem": "compressions",
+       "afogamento": "drowning water rescue", "afogado": "drowning",
+       "choque": "electrical shock electrocution", "eletrico": "electrical", "elétrico": "electrical",
+       "insolacao": "heat stroke hyperthermia", "insolação": "heat stroke",
+       "calor": "heat exhaustion hyperthermia", "fratura": "fracture splint broken bone",
+       "envenenamento": "poisoning poison ingested", "veneno": "poison",
+       "convulsao": "seizure convulsion", "convulsão": "seizure", "ataque": "seizure",
        "parada": "cpr cardiac", "cardiaca": "cpr", "ferida": "wound bleeding", "sangue": "bleeding"}
 
 
@@ -43,6 +49,9 @@ def retrieve(q, limit=4):
         core = [w for w in terms if w not in ("como", "emergencia", "agua")]
         # pares de alta especificidade: AND exato (evita OR diluir)
         PAIRS = {"choking": "infant choking", "bite": "snake bite", "snake": "snake bite", "venom": "snakebite venom", "burn": "burn first aid",
+        "drowning": "drowning rescue", "electrical": "electrical shock", "shock": "electrical shock",
+        "heat": "heat stroke", "fracture": "fracture splint", "poison": "poisoning",
+        "seizure": "seizure convulsion",
                  "bleeding": "bleeding wound", "cpr": "cpr cardiac",
                  "purifying": "purifying water"}
         fts_en = next((v for k, v in PAIRS.items() if k in core), None) or (
@@ -178,6 +187,18 @@ def answer(q):
                 domain_ok = ("beb" in sl or "infant" in sl or "crianc" in sl) and \
                             any(k in sl for k in ("golp", "palmad", "escápul", "escapul", "costas")) and \
                             "boca a boca" not in sl
+        elif any(k in ql for k in ("afog", "drown")):
+            domain_ok = any(k in sl for k in ("afog", "drown", "respira", "resgate", "water rescue"))
+        elif any(k in ql for k in ("choque", "eletr", "electr")):
+            domain_ok = any(k in sl for k in ("choque", "eletr", "electr", "corrente"))
+        elif any(k in ql for k in ("insol", "calor", "heat")):
+            domain_ok = any(k in sl for k in ("insol", "calor", "heat", "hiperterm"))
+        elif any(k in ql for k in ("fratura", "fracture", "osso")):
+            domain_ok = any(k in sl for k in ("fratur", "fracture", "splint", "osso", "imobil"))
+        elif any(k in ql for k in ("envenen", "poison", "veneno")):
+            domain_ok = any(k in sl for k in ("envenen", "poison", "veneno", "inger"))
+        elif any(k in ql for k in ("convuls", "seizure", "ataque")):
+            domain_ok = any(k in sl for k in ("convuls", "seizure", "ataque", "crise"))
         elif any(k in ql for k in ("sangr", "ferida", "bleed")):
             domain_ok = any(k in sl for k in ("sangr", "ferida", "bleed", "press", "torniq"))
         # gate de IDIOMA: resposta de sobrevivencia tem de ser PT. Se a linha
