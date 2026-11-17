@@ -244,6 +244,24 @@ def answer(q):
         elif any(k in ql for k in ("engasg", "chok", "bebe", "infant")) and re.search(r"chok|engasg", support):
             rules.append("1. Se o bebe esta engasgado: apoie o corpo no antebraco com a cabeca mais baixa que o peito. [Fonte: choking infant]")
             rules.append("2. Dê 3 a 4 golpes nas costas entre as escapulas; se nao resolver, iniciar CPR e pedir ajuda. [Fonte: choking infant]")
+        elif any(k in ql for k in ("afog", "drown")) and re.search(r"drown|afog", support):
+            rules.append("1. Use boia, corda ou colete para alcancar a vitima sem entrar na agua; nao va sem seguranca. [Fonte: drowning rescue]")
+            rules.append("2. Ao tirar, verifique respiracao; se nao respirar, inicie RCP e chame ajuda. [Fonte: drowning rescue / CPR]")
+        elif any(k in ql for k in ("choque", "eletr", "electr")) and re.search(r"electr|shock|choque", support):
+            rules.append("1. Desligue a fonte de energia antes de tocar na vitima; nao use as maos diretas. [Fonte: electrical shock]")
+            rules.append("2. Choques de alta tensao podem causar queimaduras internas e parada cardiaca — procure ajuda medica urgente. [Fonte: electrical shock]")
+        elif any(k in ql for k in ("insol", "calor", "heat")) and re.search(r"heat|calor|insol", support):
+            rules.append("1. Leve a pessoa para sombra, retire roupa excessiva e ofereca agua. [Fonte: heat stroke]")
+            rules.append("2. Se houver confusao, desmaio ou temperatura muito alta, resfrie o corpo e chame ajuda urgente. [Fonte: heat stroke]")
+        elif any(k in ql for k in ("fratura", "fracture", "osso")) and re.search(r"fractur|fratur|splint", support):
+            rules.append("1. Imobilize o membro com tala rigida e acolchoamento; para perna, use a outra perna como apoio. [Fonte: fracture splint]")
+            rules.append("2. Na movimente a area, controle sangramento se houver e procure ajuda. [Fonte: fracture splint]")
+        elif any(k in ql for k in ("envenen", "poison", "veneno")) and re.search(r"poison|envenen", support):
+            rules.append("1. Ligue para o centro de controle de veneno ou busque ajuda medica imediatamente. [Fonte: poisoning]")
+            rules.append("2. NAO provoque vomito sem orientacao medica; guarde a embalagem do produto. [Fonte: poisoning]")
+        elif any(k in ql for k in ("convuls", "seizure", "ataque")) and re.search(r"seiz|convuls", support):
+            rules.append("1. Afaste objetos proximos e deite a pessoa de lado, mantendo a via aerea livre. [Fonte: seizure first aid]")
+            rules.append("2. NAO conte os movimentos nem coloque nada na boca; chame ajuda se durar muito ou repetir. [Fonte: seizure first aid]")
         if rules:
             return ("RESPOSTA TAB (offline, fontes verificadas) — " + q + "\n"
                     + "\n".join(rules) + "\n\nVEREDITO: CONFIAVEL (extraido das fontes; SLM reprovado no gate)\n"
