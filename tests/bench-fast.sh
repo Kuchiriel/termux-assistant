@@ -10,7 +10,10 @@ for q in \
  "afogamento primeiros socorros" "choque eletrico o que fazer" "insolacao calor extremo o que fazer" \
  "fratura perna o que fazer" "envenenamento por comida o que fazer" "convulsao o que fazer" \
  "hipotermia o que fazer" "queimadura quimica o que fazer" "desidratacao o que fazer" \
- "avc derrame sinais" "posso usar torniquete em mordida de cobra"; do
+ "avc derrame sinais" "posso usar torniquete em mordida de cobra" \
+ "picada de inseto o que fazer" "mordida de animal cachorro o que fazer" \
+ "intoxicacao por fumaca o que fazer" "epistaxe sangramento no nariz o que fazer" \
+ "picada de carrapato o que fazer" "resgate em agua corrente sem ser nadador o que fazer"; do
   i=$((i+1)); T0=$(date +%s%3N)
   out=$(TA_SLM_OFF=1 timeout 20 python3 "$R" "$q" 2>&1)
   T1=$(date +%s%3N)
