@@ -30,6 +30,12 @@ EXP = {"agua": "water purifying purification distillation", "purificar": "purify
        "calor": "heat exhaustion hyperthermia", "fratura": "fracture splint broken bone",
        "envenenamento": "poisoning poison ingested", "veneno": "poison",
        "convulsao": "seizure convulsion", "convulsão": "seizure", "ataque": "seizure",
+       "hipotermia": "hypothermia", "frio": "cold hypothermia shivering",
+       "desidratacao": "dehydration", "desidratação": "dehydration",
+       "diarreia": "diarrhea dehydration", "sede": "thirst dehydration",
+       "avc": "stroke", "derrame": "stroke", "torniquete": "tourniquet",
+       "quimica": "chemical burn acid", "química": "chemical burn",
+       "quimico": "chemical burn", "químico": "chemical burn",
        "parada": "cpr cardiac", "cardiaca": "cpr", "ferida": "wound bleeding", "sangue": "bleeding"}
 
 
@@ -54,8 +60,9 @@ def retrieve(q, limit=4):
         "seizure": "seizure convulsion",
                  "bleeding": "bleeding wound", "cpr": "cpr cardiac",
                  "purifying": "purifying water"}
+        # OR por padrao: o termo PT nao existe no corpus (ingles), entao AND
+        # com a palavra original zera o resultado. AND so nos pares exatos.
         fts_en = next((v for k, v in PAIRS.items() if k in core), None) or (
-            " AND ".join(core[:2]) if len(core) >= 2 else
             " OR ".join(core) or "water purification")
         rows = c.execute("select title, body, source, bm25(docs) as s from docs "
                          "where docs match ? order by s limit 14", (fts_en,)).fetchall()
@@ -178,6 +185,21 @@ def deterministic_rules(q: str, rows) -> list[str]:
     elif any(k in ql for k in ("cobra", "picada", "mordida", "snake", "bite")) and re.search(r"snake|venom|mordida|picada", support):
         rules.append("1. Acalme e mantenha a vitima calma e imobil; nao corte nem sugar a mordida. [Fonte: snake bite]")
         rules.append("2. Aplique imobilizacao com pressao no membro atingido e procure ajuda medica urgente. [Fonte: snake bite]")
+    elif any(k in ql for k in ("hipoterm", "frio", "cold")) and re.search(r"hypotherm|shiver", support):
+        rules.append("1. Leve a pessoa para lugar quente e seco, retire roupa molhada e envolva com cobertores. [Fonte: hypothermia]")
+        rules.append("2. Se houver confusao, respiracao lenta ou inconsciencia, e um frio severo: aqueça devagar e chame ajuda. [Fonte: hypothermia]")
+    elif any(k in ql for k in ("quimic", "chemical", "acido", "alcali")) and re.search(r"chemical|acid|alkali", support):
+        rules.append("1. Afaste a pessoa da fonte do quimico e retire roupas contaminadas sem espalhar o produto. [Fonte: chemical burn]")
+        rules.append("2. Lave a area com muita agua corrente por pelo menos 20 minutos e procure ajuda medica. [Fonte: chemical burn]")
+    elif any(k in ql for k in ("desidrat", "diarre", "desmaio por calor")) and re.search(r"dehydrat|thirst", support):
+        rules.append("1. Sinais: sede extrema, boca seca, urina escura, tontura e confusao. [Fonte: dehydration]")
+        rules.append("2. Hidrate imediatamente com agua e solucao de reidratacao oral; se piorar, procure ajuda. [Fonte: dehydration]")
+    elif any(k in ql for k in ("avc", "derrame", "stroke")) and re.search(r"stroke|fast", support):
+        rules.append("1. Use FAST: Face (boca torta), Arms (braco cai), Speech (fala enrolada), Time. [Fonte: stroke FAST]")
+        rules.append("2. Ligue para o servico de emergencia imediatamente: cada minuto conta. [Fonte: stroke FAST]")
+    elif any(k in ql for k in ("torniquete", "torniq")) and re.search(r"tourniquet|torniquet", support):
+        rules.append("1. Torniquete so depois que a pressao direta falhar, ou se o membro foi decepado. [Fonte: tourniquet]")
+        rules.append("2. Em mordida de cobra o torniquete NAO deve ser usado: prefira pressao no local e imobilize o membro. [Fonte: tourniquet / snake bite]")
     elif any(k in ql for k in ("afog", "drown")) and re.search(r"drown|afog", support):
         rules.append("1. Use boia, corda ou colete para alcancar a vitima sem entrar na agua; nao va sem seguranca. [Fonte: drowning rescue]")
         rules.append("2. Ao tirar, verifique respiracao; se nao respirar, inicie RCP e chame ajuda. [Fonte: drowning rescue / CPR]")
