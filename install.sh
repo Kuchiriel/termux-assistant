@@ -30,6 +30,18 @@ inst() {
     cp -p "$dst" "$dst.ta-backup-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
   fi
   cp "$src" "$dst" && chmod "$mode" "$dst"
+  # REGRA 7 (medido): o repo usa shebang portavel (/usr/bin/env) e o Termux
+  # NAO tem /usr/bin/env. Ao instalar no runtime, normaliza o shebang:
+  #   python3 -> $PREFIX/bin/python3 ; bash/sh -> $PREFIX/bin/bash
+  case "$dst" in
+    "$HOME"/bin/*|"$HOME"/.local/share/*)
+      case "$(head -1 "$dst" 2>/dev/null)" in
+        "#!/usr/bin/env python3") sed -i "1s|.*|#!$PREFIX/bin/python3|" "$dst" ;;
+        "#!/usr/bin/env bash")     sed -i "1s|.*|#!$PREFIX/bin/bash|" "$dst" ;;
+        "#!/usr/bin/env sh")       sed -i "1s|.*|#!$PREFIX/bin/sh|" "$dst" ;;
+      esac
+      ;;
+  esac
 }
 link_shortcut() {
   local wname="${1:-}"
