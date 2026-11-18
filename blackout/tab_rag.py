@@ -215,6 +215,12 @@ def deterministic_rules(q: str, rows) -> list[str]:
     elif any(k in ql for k in ("envenen", "poison", "veneno")) and re.search(r"poison|envenen", support):
         rules.append("1. Ligue para o centro de controle de veneno ou busque ajuda medica imediatamente. [Fonte: poisoning]")
         rules.append("2. NAO provoque vomito sem orientacao medica; guarde a embalagem do produto. [Fonte: poisoning]")
+    elif any(k in ql for k in ("sangr", "ferida", "tiro o pano", "parou de sangrar")) and re.search(r"bleed|sangr|dressing", support):
+        rules.append("1. Mantenha a pressao direta com pano limpo; NAO levante o pano para conferir. [Fonte: bleeding control]")
+        rules.append("2. Se o sangue atravessar, coloque mais pano por cima e procure ajuda. [Fonte: bleeding control]")
+    elif any(k in ql for k in ("afog", "drown", "entrar na agua")) and re.search(r"drown|water rescue", support):
+        rules.append("1. NAO entre na agua sem equipamento: use boia, corda ou colete e puxe de fora. [Fonte: drowning rescue]")
+        rules.append("2. Se precisar entrar, chame socorro especializado; a vitima pode puxar o socorrista. [Fonte: drowning rescue]")
     elif any(k in ql for k in ("convuls", "seizure", "ataque")) and re.search(r"seiz|convuls", support):
         rules.append("1. Afaste objetos proximos e deite a pessoa de lado, mantendo a via aerea livre. [Fonte: seizure first aid]")
         rules.append("2. NAO conte os movimentos nem coloque nada na boca; chame ajuda se durar muito ou repetir. [Fonte: seizure first aid]")
