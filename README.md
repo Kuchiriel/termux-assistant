@@ -7,6 +7,14 @@ plugins, scripts, atalhos de widget, ponteiros AGENTS e backup contra uninstall.
 > **Fonte de verdade**: este repo. **Nada de segredo aqui**: tokens ficam em
 > arquivos 600 no aparelho e são apontados por `.env.example`.
 
+## Regra P0 (antes de tudo)
+
+Todo erro encontrado vira **correção registrada na sequência**: pare, meça o
+erro exato, ache a causa, corrija na origem, prove rodando de novo e registre
+em `~/ai-mesh/docs/ARMADILHAS.md` via `~/bin/lesson` — **antes** de continuar.
+Nunca repita um comando falho "a ver se funciona" e nunca deixe outro agente
+redescobrir. Regra completa: `docs/REGRAS-P0.md`.
+
 ## Instalação em um comando
 
 ```bash
