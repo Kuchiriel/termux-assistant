@@ -401,6 +401,24 @@ def cmd_tui(doc: dict, args) -> int:
 
 
 
+def cmd_research(doc, args) -> int:
+    import subprocess
+    script = Path.home() / "bin/research2ab"
+    if not script.is_file():
+        script = Path.home() / "projects/termux-assistant/bin/research2ab"
+    p = subprocess.run(["python3", str(script), "list"], capture_output=True, text=True, timeout=60)
+    out = (p.stdout or "").strip()
+    if "sem digests" in out:
+        # os digests moram no host: usa o tunel SSH (porta 8765 ja aberta)
+        tun = subprocess.run(["ssh", "-6", "-o", "ConnectTimeout=6", "-o", "BatchMode=yes",
+                              "nixos@fd7a:115c:a1e0::7f01:64bd",
+                              "python3 ~/projects/nixos-ai/scripts/research2ab list"],
+                             capture_output=True, text=True, timeout=40)
+        out = (tun.stdout or "").strip() or (tun.stderr or "host fora").strip()
+    print(out)
+    return 0
+
+
 def cmd_backlog(doc, args) -> int:
     import subprocess
     script = Path.home() / "bin/backlog"
@@ -435,6 +453,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--json", action="store_true")
     q.set_defaults(fn=cmd_search)
 
+    q = sub.add_parser("research", help="esteira video/paper -> hipotese (14 digests)")
+    q.set_defaults(fn=cmd_research)
     q = sub.add_parser("backlog", help="fila única de pendências (regra P0)")
     q.set_defaults(fn=cmd_backlog)
     q = sub.add_parser("status", help="status e última medição")

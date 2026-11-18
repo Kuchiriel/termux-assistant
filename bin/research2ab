@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""research2ab — transforma digest de vídeo/paper em hipótese com checker.
+
+Esteira (visível, auditável, COM DONO):
+  fonte (yt digest | paper | github feed)
+    -> hipótese com métrica e gate (o que medir, onde, limite)
+    -> backlog (~/bin/backlog add) com owner/host
+    -> A/B (lab doctor + lab arm) decide
+    -> publicação: ai-mesh/docs + house status + bus #100
+
+Nada de "research em background invisível". Cada fonte vira item com dono.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+BACKLOG = Path.home() / "bin/backlog"
+DIGESTS = Path.home() / "Books/videos"
+AIMESH = Path.home() / "ai-mesh"
+
+
+def run(cmd, timeout=60):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.stdout or p.stderr
+    except Exception as exc:
+        return f"(erro {type(exc).__name__})"
+
+
+def listar():
+    if not DIGESTS.is_dir():
+        return print("sem digests locais (host nitro-v15:~/Books/videos)")
+    files = sorted(DIGESTS.glob("*/*.DIGEST.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    print(f"digests locais: {len(files)}")
+    for p in files[:20]:
+        head = p.read_text(errors="replace")[:180].replace("\n", " ")
+        print(f"  {p.parent.name} | {head[:120]}")
+
+
+def hipotese(titulo, metrica, gate, owner, host):
+    cmd = [str(BACKLOG), "add", f"H: {titulo} — medir {metrica}; gate {gate}",
+           "--owner", owner, "--host", host]
+    print(run(cmd).strip())
+    print("hipótese registrada no backlog. Próximo: `lab doctor` e `lab arm <braço>`.")
+
+
+def main():
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("list")
+    q = sub.add_parser("hipotese")
+    q.add_argument("titulo"); q.add_argument("--metrica", required=True)
+    q.add_argument("--gate", required=True); q.add_argument("--owner", default="tab")
+    q.add_argument("--host", default="termux")
+    a = p.parse_args()
+    if a.cmd == "list":
+        listar()
+    elif a.cmd == "hipotese":
+        hipotese(a.titulo, a.metrica, a.gate, a.owner, a.host)
+    else:
+        print("uso: research2ab list | research2ab hipotese 'X' --metrica Y --gate Z")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
