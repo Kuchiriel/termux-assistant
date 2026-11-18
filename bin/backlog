@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""backlog — fila unica de pendencias com estado e 'ja resolvido' (regra P0).
+
+Uso:
+  backlog list [--open|--done]
+  backlog add "tarefa" --owner X --host Y
+  backlog done <id> --evidence "numero/arquivo/PR"
+  backlog check            #Mostra o que esta aberto e o que ja tem evidencia
+
+Fonte: ~/.local/state/termux-assistant/backlog.json (append-only em eventos).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+F = Path.home() / ".local/state/termux-assistant/backlog.json"
+
+
+def load():
+    if not F.is_file(): return {"items": []}
+    try: return json.loads(F.read_text(encoding="utf-8"))
+    except Exception: return {"items": []}
+
+
+def save(d):
+    F.parent.mkdir(parents=True, exist_ok=True)
+    F.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def main():
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd")
+    q = sub.add_parser("add"); q.add_argument("task"); q.add_argument("--owner", default=""); q.add_argument("--host", default="")
+    q = sub.add_parser("done"); q.add_argument("id", type=int); q.add_argument("--evidence", required=True)
+    q = sub.add_parser("list"); q.add_argument("--all", action="store_true")
+    sub.add_parser("check")
+    a = p.parse_args()
+    d = load(); items = d["items"]
+
+    if a.cmd == "add":
+        items.append({"id": len(items)+1, "task": a.task, "owner": a.owner,
+                      "host": a.host, "status": "open", "evidence": "",
+                      "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+        save(d); print(f"#{len(items)} {a.task}")
+    elif a.cmd == "done":
+        for it in items:
+            if it["id"] == a.id:
+                it["status"] = "done"; it["evidence"] = a.evidence
+                print(f"#{a.id} done: {a.evidence[:80]}"); break
+        save(d)
+    elif a.cmd == "check":
+        abertos = [i for i in items if i["status"] == "open"]
+        print(f"abertos={len(abertos)} total={len(items)}")
+        for i in abertos[:12]: print(f"  #{i['id']:02d} [{i['owner'] or '?'}] {i['task'][:80]}")
+    else:
+        for i in items:
+            if not a.all and i["status"] != "open": continue
+            print(f"#{i['id']:02d} [{i['status']}] {i['task'][:90]} "
+                  f"({i['owner'] or '?'}/{i['host'] or '?'}) {i['evidence'][:60]}")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
