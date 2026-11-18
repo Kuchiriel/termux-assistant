@@ -1,0 +1,59 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# lesson — registra e verifica a regra P0 (erro -> causa -> correcao).
+# Uso:
+#   lesson "comando" "erro" "causa" "correcao"   # registra (append)
+#   lesson --check                              # lista armadilhas conhecidas
+#   lesson --stats                              # contagens
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+F="$HOME/ai-mesh/docs/ARMADILHAS.md"
+mkdir -p "$(dirname "$F")"
+[ -f "$F" ] || cat > "$F" <<'EOF'
+# Armadilhas da casa — erro exato -> causa -> correção
+
+> Regra P0: todo erro encontrado vira correção registrada aqui, na sequência.
+> Antes de repetir um comando que falhou, leia este arquivo.
+EOF
+
+case "${1:-}" in
+  --check)
+    echo "=== ARMADILHAS REGISTRADAS ($(grep -c '^## ' "$F" 2>/dev/null || echo 0)) ==="
+    grep -E '^## |^Erro:|^Correcao:' "$F" 2>/dev/null | tail -30
+    ;;
+  --stats)
+    n=$(grep -c '^## ' "$F" 2>/dev/null || echo 0)
+    hosts=$(grep -c '^Host:' "$F" 2>/dev/null || echo 0)
+    echo "armadilhas=$n entradas_host=$hosts arquivo=$F"
+    ;;
+  "")
+    echo "uso: lesson 'comando' 'erro' 'causa' 'correcao' | lesson --check | lesson --stats" >&2
+    exit 2
+    ;;
+  *)
+    cmd="$1"; err="${2:-}"; cause="${3:-}"; fix="${4:-}"
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    host=$(hostname 2>/dev/null || echo termux)
+    {
+      printf '\n## %s\n\n' "$(printf '%s' "$cmd" | head -c 90)"
+      printf 'Host: %s\n' "$host"
+      printf 'Erro: %s\n' "$(printf '%s' "$err" | head -c 200)"
+      printf 'Causa: %s\n' "$(printf '%s' "$cause" | head -c 300)"
+      printf 'Correcao: %s\n' "$(printf '%s' "$fix" | head -c 300)"
+      printf 'Quando: %s\n' "$ts"
+    } >> "$F"
+    echo "registrado em $F"
+    # entrada curta na memoria episodica (append-only)
+    M="$HOME/ai-mesh/memory/episodic/$( [ -f /data/data/com.termux/files/usr/bin/python3 ] && echo termux || echo linux ).jsonl"
+    python3 - "$M" "$cmd" "$err" "$cause" "$fix" <<'PY'
+import json,sys,datetime
+p,cmd,err,cause,fix=sys.argv[1:6]
+d={"ts":datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+   "host":"termux","kind":"fix",
+   "tags":["p0","erro","correcao"],
+   "text":f"cmd={cmd[:80]} | erro={err[:100]} | causa={cause[:120]} | correcao={fix[:120]}"}
+try:
+    open(p,"a",encoding="utf-8").write(json.dumps(d,ensure_ascii=False)+"\n")
+except Exception: pass
+PY
+    ;;
+esac

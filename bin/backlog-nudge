@@ -1,0 +1,33 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# backlog-nudge — cobra 1 vez por item aberto ha >30min cujo dono esta ativo.
+# Anti-flood:不下 mais de 1 lembrete por item por hora (flag em ~/.local/state/backlog-nudge/).
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+S="$HOME/.local/state/backlog-nudge"; mkdir -p "$S"
+B="$HOME/bin/backlog"
+[ -x "$B" ] || B="$HOME/projects/termux-assistant/bin/backlog"
+python3 - "$B" "$S" <<'PY'
+import json,sys,subprocess,time,os
+from pathlib import Path
+bl,statedir=sys.argv[1],Path(sys.argv[2])
+try: d=json.loads(Path.home().joinpath('.local/state/termux-assistant/backlog.json').read_text())
+except Exception: raise SystemExit(0)
+now=time.time()
+for it in d.get('items',[]):
+    if it.get('status')!='open': continue
+    ts=it.get('ts','')
+    try:
+        t=time.mktime(time.strptime(ts[:19],'%Y-%m-%dT%H:%M:%S'))
+    except Exception:
+        t=now
+    if now-t < 1800: continue
+    owner=it.get('owner') or ''
+    flag=statedir/f"{it['id']}-{int(now//3600)}"
+    if flag.exists(): continue
+    flag.write_text('ok')
+    msg=(f"COBRANCA P0: backlog #{it['id']} ({owner}) aberto ha "
+         f"{int((now-t)/60)}min. Entregue ou devolva o item com motivo; "
+         "NAO responda 'vou ver'. Use backlog done <id> --evidence '<numero>'.")
+    subprocess.run(['bash','-lc',f'~/bin/bus-post {msg@Q} --to {owner@Q} --kind msg >/dev/null 2>&1 || true'], timeout=40)
+    print('nudge',it['id'],owner)
+PY
