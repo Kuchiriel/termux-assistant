@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# tab-fast — resposta de emergência SEM SLM: gerador deterministico + corpus.
+# Objetivo: <2 s, sem rede, sem modelo, sem aquecer o aparelho.
+# O SLM (tab_rag) continua como camada opcional para perguntas que nao tem
+# regra deterministica.
+set -uo pipefail
+R="$HOME/projects/termux-assistant/blackout/tab_rag.py"
+Q="${*:-}"
+[ -z "$Q" ] && { echo "uso: tab-fast 'pergunta'"; exit 2; }
+T0=$(date +%s%3N)
+# 1) regra deterministica pura (sem llama): usa tab_rag com TA_SLM_OFF=1
+out=$(TA_SLM_OFF=1 TA_SLM_N=1 timeout 20 python3 "$R" "$Q" 2>&1)
+T1=$(date +%s%3N)
+if printf '%s' "$out" | grep -qE '^[0-9]+\.|^  • '; then
+  printf '%s\n' "$out"
+  printf '\n[tab-fast %sms, sem SLM]\n' "$((T1-T0))"
+  exit 0
+fi
+# 2) fallback: corpus direto (BM25) para o que nao tem regra
+printf '%s\n' "$out"
+printf '\n[tab-fast %sms, sem SLM]\n' "$((T1-T0))"

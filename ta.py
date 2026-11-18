@@ -122,6 +122,13 @@ def restore(a):
     return rc
 
 
+def tabfast(a):
+    script = REPO / "bin/tab-fast"
+    rc, out = run([str(script), *a.rest], 60)
+    print(out, end="")
+    return rc
+
+
 def slm(a):
     script = REPO / "bin/tab-slm"
     rc, out = run([str(script), *a.rest], 300)
@@ -160,13 +167,14 @@ def main(argv=None):
         ("widgets", widgets, "instalar/refrescar atalhos"),
         ("backup", backup, "backup completo"),
         ("restore", restore, "restaurar backup"),
+        ("tab", tabfast, "emergencia offline rapida (sem SLM)"),
         ("slm", slm, "pergunta one-shot ao SLM local"),
         ("secrets", secrets, "auditar segredos"),
         ("status", status, "lab + casa"),
     ]:
         q = sub.add_parser(name, help=helptext)
         q.set_defaults(fn=fn)
-        if name in ("slm", "chat", "offline", "linux"):
+        if name in ("slm", "tab", "chat", "offline", "linux"):
             q.add_argument("rest_args", nargs="*", help=argparse.SUPPRESS)
     a = p.parse_args(argv)
     if getattr(a, "rest_args", None):

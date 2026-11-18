@@ -1,0 +1,13 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# crouton-socorro — emergencia offline RAPIDA (sem SLM, sem internet, sem aquecer).
+set -uo pipefail
+export PATH="$HOME/bin:$PATH"
+q="${TAB_QUERY:-}"
+if [ -z "$q" ]; then
+  q="$(termux-dialog text -t "SOCORRO (offline)" -i "Ex: purificar agua" | python3 -c 'import json,sys;print((json.load(sys.stdin).get("text") or "").strip())')"
+fi
+[ -z "$q" ] && exit 0
+out="$(TA_SLM_OFF=1 timeout 20 python3 "$HOME/projects/termux-assistant/blackout/tab_rag.py" "$q" 2>&1)"
+termux-vibrate -d 60 2>/dev/null || true
+if [ "${TAB_STDOUT:-0}" = "1" ]; then printf '%s\n' "$out"; exit 0; fi
+termux-dialog text -t "SOCORRO: $q" -i "$out" >/dev/null 2>&1 || printf '%s\n' "$out" | termux-toast -g middle
