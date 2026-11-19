@@ -11,8 +11,8 @@
 # ativo no host.
 set -uo pipefail
 
-HOST6='${TA_LINUX_HOST6:-fd7a:115c:a1e0::7f01:64bd}'
-HOST4='${TA_LINUX_LAN:-192.168.15.10}'
+HOST6="${TA_LINUX_HOST6:-fd7a:115c:a1e0::7f01:64bd}"
+HOST4="${TA_LINUX_LAN:-192.168.15.10}"
 USERH='nixos'
 REPO='projects/nixos-ai'
 LAB_TIMEOUT="${LAB_TIMEOUT:-900}"
@@ -21,6 +21,7 @@ CONNECT_TIMEOUT="${LAB_CONNECT_TIMEOUT:-8}"
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "uso: lab status|doctor|run [L1|L2|L3]|level Lx|arm b|m|a|pause|resume|stop|restart|logs [N]|gpu|checkers"
     echo "env: LAB_TIMEOUT=${LAB_TIMEOUT}s CONNECT_TIMEOUT=${CONNECT_TIMEOUT}s"
+    echo "rotas: ipv6=$HOST6 lan=$HOST4"
     exit 0
 fi
 
