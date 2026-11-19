@@ -28,6 +28,8 @@ for it in d.get('items',[]):
     msg=(f"COBRANCA P0: backlog #{it['id']} ({owner}) aberto ha "
          f"{int((now-t)/60)}min. Entregue ou devolva o item com motivo; "
          "NAO responda 'vou ver'. Use backlog done <id> --evidence '<numero>'.")
-    subprocess.run(['bash','-lc',f'~/bin/bus-post {msg@Q} --to {owner@Q} --kind msg >/dev/null 2>&1 || true'], timeout=40)
+    post = ['/data/data/com.termux/files/usr/bin/bash','-c',
+            '~/bin/bus-post "$1" --to "$2" --kind msg >/dev/null 2>&1 || true','--',msg,owner]
+    subprocess.run(post, timeout=40)
     print('nudge',it['id'],owner)
 PY
