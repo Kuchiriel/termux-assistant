@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# vpn-guard — garante 1 VPN por vez na casa (medido 18/11: Mullvad + Tailscale
+# juntos mataram a tailnet: netcheck UDP=false, peers offline, coord-mcp inacessivel).
+#
+# Uso:
+#   vpn-guard check            # diagnostico (nao muda nada)
+#   vpn-guard fix              # se a tailnet estiver Morta e houver outra VPN, desliga a outra
+#   vpn-guard install          # instala como timer do host
+set -uo pipefail
+STATE="$HOME/.local/state/vpn-guard"
+mkdir -p "$STATE"
+LOG="$STATE/vpn-guard.log"
+say() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG"; }
+
+netcheck() {
+  timeout 30 tailscale netcheck 2>/dev/null | grep -E "^\s+\* UDP:" | head -1 | grep -q "true"
+}
+
+other_vpn_units() {
+  for u in mullvad-daemon wg-quick-mullvad protonvpn-cli nordvpn-daemon; do
+    systemctl is-active "$u" >/dev/null 2>&1 && echo "$u"
+  done
+}
+
+case "${1:-check}" in
+  check)
+    if netcheck; then say "tailnet OK (UDP true)"; exit 0; fi
+    say "tailnet DEAD (UDP false)"
+    echo "VPNs ativas: $(other_vpn_units | tr '\n' ' ')"
+    exit 1
+    ;;
+  fix)
+    if netcheck; then say "tailnet OK, nada a fazer"; exit 0; fi
+    units=$(other_vpn_units)
+    [ -z "$units" ] && { say "tailnet dead mas nenhuma outra VPN ativa — outro causa"; exit 1; }
+    for u in $units; do
+      say "tailnet dead: desligando $u (1 VPN por vez)"
+      sudo -n systemctl stop "$u" && say "$u parado" || say "falha ao parar $u"
+    done
+    sleep 4
+    if netcheck; then say "RECOVERY: tailnet voltou apos desligar a outra VPN"; exit 0; fi
+    say "ainda dead — investigar firewall/DERP (ver ARMADILHAS.md)"; exit 1
+    ;;
+  install)
+    mkdir -p "$HOME/.config/systemd/user"
+    cat > "$HOME/.config/systemd/user/vpn-guard.service" <<EOF
+[Unit]
+Description=Guarda 1 VPN por vez (Mullvad x Tailscale)
+[Service]
+Type=oneshot
+ExecStart=$HOME/bin/vpn-guard fix
+EOF
+    cat > "$HOME/.config/systemd/user/vpn-guard.timer" <<EOF
+[Unit]
+Description=Checa a tailnet a cada 15 min
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl --user daemon-reload && systemctl --user enable --now vpn-guard.timer
+    say "timer vpn-guard instalado"
+    ;;
+  *) echo "uso: vpn-guard check|fix|install"; exit 2 ;;
+esac
