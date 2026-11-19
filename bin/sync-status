@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""sync-status — report tool/plugin/skill drift between Termux and Linux. READ-ONLY.
+
+MEDIDO 19/11: phone ~/bin has 171 scripts, host ~/bin has 11; phone plugins=1,
+host plugins=4. Nobody could see this, so divergence was invisible until breakage.
+
+POLITICA: NEVER overwrite, NEVER copy, NEVER delete. This tool only REPORTS:
+  - comum (presente nos dois, com hash — divergencia de conteudo e' sinalizada)
+  - so-celular / so-host (item ausente do outro lado)
+  - skills (ai-mesh/skills e o equivalente do host)
+
+Uso:
+  sync-status                 # tabela legivel
+  sync-status --json          # parao jobs/nudge
+  sync-status --check         # exit 1 se houver divergencia (gate)
+
+O manifesto e' gravado em ~/.local/state/sync-manifest.json (somente leitura
+dos dados, sem segredos: so nomes, tamanhos e hashes).
+"""
+import argparse
+import hashlib
+import json
+import subprocess
+import time
+from pathlib import Path
+
+PHONE = Path("/data/data/com.termux/files/home")
+HOST = "nixos@fd7a:115c:a1e0::7f01:64bd"
+OUT = PHONE / ".local/state/sync-manifest.json"
+
+
+def sha_local(p: Path) -> str:
+    h = hashlib.sha256()
+    try:
+        with p.open("rb") as f:
+            for c in iter(lambda: f.read(1 << 20), b""):
+                h.update(c)
+        return h.hexdigest()[:12]
+    except Exception:
+        return "erro"
+
+
+def local_files(d: Path) -> dict:
+    out = {}
+    if not d.is_dir():
+        return out
+    for p in sorted(d.iterdir()):
+        if not p.is_file():
+            continue
+        if ".bak" in p.name or ".ta-backup" in p.name:
+            continue
+        out[p.name] = sha_local(p)
+    return out
+
+
+def host_files(remote_dir: str) -> dict:
+    # helper remoto evita aspas aninhadas (medido 19/11: versao inline retornava 0)
+    cmd = f"ssh -6 -o ConnectTimeout=8 {HOST} 'python3 /tmp/host_file_manifest.py {remote_dir}'"
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=40)
+        lines = [x for x in r.stdout.strip().splitlines() if x.startswith("{")]
+        return json.loads(lines[-1]) if lines else {}
+    except Exception:
+        return {}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--check", action="store_true")
+    a = ap.parse_args()
+
+    sets = {
+        "bin": (local_files(PHONE / "bin"), host_files("/home/nixos/bin")),
+        "plugins": (local_files(PHONE / ".config/opencode/plugins"),
+                    host_files("/home/nixos/.config/opencode/plugins")),
+        "skills": (local_files(PHONE / "ai-mesh/skills"),
+                   host_files("/home/nixos/projects/ai-mesh/skills")),
+    }
+    report = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "sets": {}, "policy": "report-only; no overwrite"}
+    drift = 0
+    for name, (ph, ho) in sets.items():
+        comum = sorted(set(ph) & set(ho))
+        diff = [n for n in comum if ph[n] != ho[n]]
+        so_phone = sorted(set(ph) - set(ho))
+        so_host = sorted(set(ho) - set(ph))
+        report["sets"][name] = {"phone": len(ph), "host": len(ho), "comum": len(comum),
+                                "conteudo_divergente": diff,
+                                "so_phone": so_phone, "so_host": so_host}
+        drift += len(diff) + len(so_phone) + len(so_host)
+    report["drift_total"] = drift
+    OUT.write_text(json.dumps(report, ensure_ascii=False, indent=1))
+
+    if a.json:
+        print(json.dumps(report, ensure_ascii=False, indent=1))
+    else:
+        print(f"sync-status: drift={drift} (report-only, nada copiado)")
+        for name, r in report["sets"].items():
+            print(f"  {name:8} phone={r['phone']:4} host={r['host']:4} comum={r['comum']:4} "
+                  f"divergentes={len(r['conteudo_divergente']):3} "
+                  f"so-phone={len(r['so_phone']):3} so-host={len(r['so_host']):3}")
+            if r["conteudo_divergente"]:
+                print(f"    conteúdo diferente: {', '.join(r['conteudo_divergente'][:8])}")
+            if r["so_host"]:
+                print(f"    só no host (amostra): {', '.join(r['so_host'][:8])}")
+        print(f"manifesto: {OUT}")
+    if a.check and drift:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
