@@ -1,0 +1,164 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""entropy-watch — transforma achado de sensor em trabalho despachado (H-E1).
+
+POR QUE (19/11, doc ai-mesh/docs/ANTI-ENTROPIA-PESQUISA-19-11.md): a casa tem
+sensores (state-audit, manifest-check, jobs-audit, repo-integrity-check, backlog)
+mas NENHUM loop que transforme o que eles acham em conserto. Todo agente le o
+mesmo estado e ninguem conserta. Este script e' o fio que faltava.
+
+O que faz (NAO destrutivo):
+  1) roda os sensores existentes (nao reimplementa nenhum);
+  2) normaliza cada achado numa assinatura estavel (hash do conteudo);
+  3) guarda assinaturas ja vistas em ~/.local/state/entropy-seen.json;
+  4) para cada achado NOVO, enfileira via `auto-wake enqueue` (fila visivel no
+     TUI, hook idle) e escreve 1 linha no log;
+  5) --dry-run so mostra; --report mostra o estado sem enfileirar.
+
+Nao apaga nada, nao reinicia servico, nao mexe no bus (evita spam).
+
+USO:
+  entropy-watch              # enfileira consertos para achados novos
+  entropy-watch --report     # mostra o que esta na fila + vistos
+  entropy-watch --dry-run    # mostra o que enfileiraria
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import subprocess
+import time
+from pathlib import Path
+
+HOME = Path("/data/data/com.termux/files/home")
+BIN = HOME / "bin"
+STATE = HOME / ".local/state/entropy-seen.json"
+LOG = HOME / ".local/state/entropy-watch.log"
+
+
+def run(cmd: list[str], timeout: int = 60) -> tuple[int, str]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "").strip()
+    except Exception as e:
+        return 1, f"ERRO {type(e).__name__}: {e}"
+
+
+def findings() -> list[dict]:
+    out: list[dict] = []
+    # 1) estado orfao (arquivos em ~/.local/state que ninguem le)
+    rc, s = run([str(BIN / "state-audit"), "--json"])
+    if s:
+        try:
+            d = json.loads(s)
+            items = d if isinstance(d, list) else d.get("lista", d.get("orphans", d.get("itens", [])))
+            for x in items[:8]:
+                name = x.get("arquivo") or x.get("name") or x.get("path") or str(x)[:60]
+                out.append({"sensor": "state-audit", "key": str(name),
+                            "fix": f"state-audit: arquivo orfao {name} — conferir se pode ser quarentenado (manifest)"})
+        except Exception:
+            pass
+    # 2) servico declarado mas morto
+    rc, s = run([str(BIN / "manifest-check"), "--json"])
+    if s:
+        try:
+            d = json.loads(s)
+            items = d.get("down", d.get("dead", [])) if isinstance(d, dict) else []
+            for x in items[:8]:
+                key = str(x.get("name") or x.get("port") or x)[:60]
+                out.append({"sensor": "manifest-check", "key": key,
+                            "fix": f"manifest-check: servico declarado fora do ar ({key}) — subir ou corrigir manifesto"})
+        except Exception:
+            pass
+    # 3) jobs quebrados/atrasados
+    rc, s = run([str(BIN / "jobs-audit")])
+    if "QUEBRADOS: 0" not in s and s:
+        out.append({"sensor": "jobs-audit", "key": s[:120],
+                    "fix": f"jobs-audit: {s[:120]} — corrigir shebang/trace do job quebrado"})
+    # 4) repo com conflito / JSONL invalido (rodar DENTRO do ai-mesh)
+    rc, s = run(["git", "-C", str(HOME / "ai-mesh"), "rev-parse", "--is-inside-work-tree"])
+    if rc == 0:
+        rc, s = run([str(BIN / "repo-integrity-check")], timeout=60)
+        # repo-integrity-check roda no cwd; usar subprocess com cwd explicito
+        try:
+            p = subprocess.run([str(BIN / "repo-integrity-check")], cwd=str(HOME / "ai-mesh"),
+                               capture_output=True, text=True, timeout=60)
+            rc, s = p.returncode, (p.stdout or p.stderr or "").strip()
+        except Exception as e:
+            rc, s = 1, str(e)
+    if rc != 0:
+        out.append({"sensor": "repo-integrity-check", "key": s[:120] or f"rc={rc}",
+                    "fix": "repo-integrity-check: conflito ou JSONL invalido — resolver antes de commitar"})
+    # 5) docs do indice desatualizados
+    rc, s = run([str(BIN / "house"), "docs", "--check"])
+    if "OK" not in s and s:
+        out.append({"sensor": "house docs", "key": s[:120],
+                    "fix": "house docs --check: indice desatualizado — rodar house docs e commitar"})
+    # 6) backlog aberto sem evidencia ha > 30 min (usa o JSON local)
+    bp = HOME / ".local/state/termux-assistant/backlog.json"
+    if bp.is_file():
+        try:
+            d = json.loads(bp.read_text())
+            now = time.time()
+            for it in d.get("items", []):
+                if it.get("status") in ("ABERTO", "OPEN", "TODO", None) and not it.get("done"):
+                    ts = it.get("created") or it.get("ts")
+                    if isinstance(ts, (int, float)) and now - ts > 1800:
+                        out.append({"sensor": "backlog", "key": f"#{it.get('id')}",
+                                    "fix": f"backlog #{it.get('id')} aberto >30min — medir/fechar com evidencia ou marcar blocked"})
+        except Exception:
+            pass
+    return out
+
+
+def sig(f: dict) -> str:
+    raw = f["sensor"] + "|" + f["key"]
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--report", action="store_true")
+    a = ap.parse_args()
+
+    seen = {}
+    if STATE.is_file():
+        try:
+            seen = json.loads(STATE.read_text())
+        except Exception:
+            seen = {}
+    fs = findings()
+    novos = [f for f in fs if sig(f) not in seen]
+    # os orfaos de state-audit sao ruido de baixa prioridade: vira UMA tarefa
+    # de revisao, nao 8 wakes (orcamento e' 12/hora — nao queimar em lixo).
+    orfaos = [f for f in novos if f["sensor"] == "state-audit"]
+    if len(orfaos) > 1:
+        nomes = ", ".join(f["key"] for f in orfaos[:12])
+        novos = [f for f in novos if f["sensor"] != "state-audit"]
+        novos.append({"sensor": "state-audit", "key": f"{len(orfaos)} orfaos",
+                      "fix": f"state-audit: revisar {len(orfaos)} arquivos orfaos ({nomes}) — quarentena com manifesto so se seguro"})
+    print(f"entropy-watch: {len(fs)} achado(s), {len(novos)} novo(s)")
+    for f in fs:
+        mark = "NOVO" if sig(f) not in seen else "visto"
+        print(f"  [{mark}] {f['sensor']:20} {f['key'][:70]}")
+    if a.report:
+        print(f"vistos no estado: {len(seen)}")
+        return 0
+    for f in novos:
+        if not a.dry_run:
+            rc, s = run([str(BIN / "auto-wake"), "enqueue", f["fix"]])
+            print(f"  enfileirado: {f['sensor']} rc={rc} {s[:50]}")
+            with LOG.open("a") as fh:
+                fh.write(json.dumps({"ts": time.time(), "sig": sig(f),
+                                     "sensor": f["sensor"], "fix": f["fix"]},
+                                    ensure_ascii=False) + "\n")
+        seen[sig(f)] = time.time()
+    if not a.dry_run:
+        STATE.write_text(json.dumps(seen, ensure_ascii=False, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
