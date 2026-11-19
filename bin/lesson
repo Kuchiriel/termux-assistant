@@ -2,20 +2,28 @@
 # lesson — registra e verifica a regra P0 (erro -> causa -> correcao).
 # Uso:
 #   lesson "comando" "erro" "causa" "correcao"   # registra (append)
+#   lesson --help                               # esta ajuda (nao registra nada)
 #   lesson --check                              # lista armadilhas conhecidas
 #   lesson --stats                              # contagens
 set -uo pipefail
 export PATH="$HOME/bin:$PATH"
 F="$HOME/ai-mesh/docs/ARMADILHAS.md"
-mkdir -p "$(dirname "$F")"
-[ -f "$F" ] || cat > "$F" <<'EOF'
+
+ensure_file() {
+  mkdir -p "$(dirname "$F")"
+  [ -f "$F" ] || cat > "$F" <<'EOF'
 # Armadilhas da casa — erro exato -> causa -> correção
 
 > Regra P0: todo erro encontrado vira correção registrada aqui, na sequência.
 > Antes de repetir um comando que falhou, leia este arquivo.
 EOF
+}
 
 case "${1:-}" in
+  --help|-h)
+    echo "uso: lesson 'comando' 'erro' 'causa' 'correcao' | lesson --help | lesson --check | lesson --stats"
+    exit 0
+    ;;
   --check)
     echo "=== ARMADILHAS REGISTRADAS ($(grep -c '^## ' "$F" 2>/dev/null || echo 0)) ==="
     grep -E '^## |^Erro:|^Correcao:' "$F" 2>/dev/null | tail -30
@@ -30,7 +38,13 @@ case "${1:-}" in
     exit 2
     ;;
   *)
-    cmd="$1"; err="${2:-}"; cause="${3:-}"; fix="${4:-}"
+    if [ "$#" -lt 4 ]; then
+      echo "erro: lesson exige 4 argumentos: comando, erro, causa, correcao" >&2
+      echo "uso: lesson 'comando' 'erro' 'causa' 'correcao'" >&2
+      exit 2
+    fi
+    cmd="$1"; err="$2"; cause="$3"; fix="$4"
+    ensure_file
     ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     host=$(hostname 2>/dev/null || echo termux)
     {

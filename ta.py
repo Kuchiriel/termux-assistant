@@ -144,6 +144,7 @@ def secrets(_a):
 
 
 def status(_a):
+    failed = 0
     for label, cmd in [
         ("LAB", [str(HOME / "bin/lab"), "status"]),
         ("HOUSE", [str(HOME / "bin/house"), "status"]),
@@ -151,6 +152,9 @@ def status(_a):
         rc, out = run(cmd, 60)
         print(f"=== {label} (rc={rc})")
         print("\n".join(out.splitlines()[:12]))
+        if rc != 0:
+            failed = 1
+    return failed
 
 
 def main(argv=None):
