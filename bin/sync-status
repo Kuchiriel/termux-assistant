@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/data/data/com.termux/files/usr/bin/python3
 """sync-status — report tool/plugin/skill drift between Termux and Linux. READ-ONLY.
 
 MEDIDO 19/11: phone ~/bin has 171 scripts, host ~/bin has 11; phone plugins=1,

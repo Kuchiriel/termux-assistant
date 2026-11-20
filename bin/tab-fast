@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/data/data/com.termux/files/usr/bin/bash
 # tab-fast — resposta de emergência SEM SLM: gerador deterministico + corpus.
 # Objetivo: <2 s, sem rede, sem modelo, sem aquecer o aparelho.
 # O SLM (tab_rag) continua como camada opcional para perguntas que nao tem
