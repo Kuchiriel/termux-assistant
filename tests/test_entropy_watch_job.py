@@ -116,9 +116,55 @@ class EntropyWatchJobTests(unittest.TestCase):
 
     def test_jobs_audit_knows_entropy_and_existing_job_traces(self):
         self.assertIn("job-entropy-watch.trace", jobs_audit.RASTROS["entropy-watch-job"])
-        self.assertIn("job-fleet-retry.trace", jobs_audit.RASTROS["fleet-retry"])
-        self.assertIn("job-route-watch.trace", jobs_audit.RASTROS["route-watch"])
-        self.assertIn("job-backlog-nudge.trace", jobs_audit.RASTROS["backlog-nudge"])
+        self.assertIn("state:fleet-retry/retry.log", jobs_audit.RASTROS["fleet-retry"])
+        self.assertIn("state:route-watch/route-watch.log", jobs_audit.RASTROS["route-watch"])
+        self.assertIn("state:job-backlog-nudge.trace", jobs_audit.RASTROS["backlog-nudge"])
+
+    def test_state_relative_log_is_not_treated_as_repo_relative(self):
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="jobs-audit-state-path-"))
+        home = tmp / "home"
+        state = home / ".local" / "state"
+        log = state / "fleet-retry" / "retry.log"
+        trace = state / "job-fleet-retry.trace"
+        log.parent.mkdir(parents=True)
+        log.write_text("recent\n", encoding="utf-8")
+        trace.write_text("old\n", encoding="utf-8")
+        os.utime(log, (2000, 2000))
+        os.utime(trace, (1000, 1000))
+        old_home = jobs_audit.HOME
+        try:
+            jobs_audit.HOME = str(home)
+            mtime, path = jobs_audit.ultimo_rastro("fleet-retry")
+        finally:
+            jobs_audit.HOME = old_home
+
+        self.assertEqual(str(log), path)
+        self.assertEqual(2000, int(mtime))
+
+    def test_repo_relative_inventory_is_still_resolved_against_mesh(self):
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="jobs-audit-repo-path-"))
+        home = tmp / "home"
+        state = home / ".local" / "state"
+        mesh = tmp / "ai-mesh"
+        state.mkdir(parents=True)
+        inventory = mesh / "inventory" / "termux.json"
+        inventory.parent.mkdir(parents=True)
+        inventory.write_text("{}\n", encoding="utf-8")
+        old_home = jobs_audit.HOME
+        old_mesh = os.environ.get("AI_MESH_DIR")
+        try:
+            jobs_audit.HOME = str(home)
+            os.environ["AI_MESH_DIR"] = str(mesh)
+            mtime, path = jobs_audit.ultimo_rastro("publish-inventory")
+        finally:
+            jobs_audit.HOME = old_home
+            if old_mesh is None:
+                os.environ.pop("AI_MESH_DIR", None)
+            else:
+                os.environ["AI_MESH_DIR"] = old_mesh
+
+        self.assertEqual(str(inventory), path)
+        self.assertIsNotNone(mtime)
 
 
 if __name__ == "__main__":
