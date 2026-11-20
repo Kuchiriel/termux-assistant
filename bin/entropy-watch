@@ -44,6 +44,42 @@ def run(cmd: list[str], timeout: int = 60) -> tuple[int, str]:
         return 1, f"ERRO {type(e).__name__}: {e}"
 
 
+def manifest_findings(data: dict) -> list[dict]:
+    """Converte o contrato JSON real do manifest-check em achados acionaveis.
+
+    O manifest-check atual emite `servicos`, `fora_do_ar`, `scripts_ausentes`
+    e `scripts_nao_executaveis`. As chaves antigas `down`/`dead` continuam
+    aceitas para compatibilidade com payloads antigos.
+    """
+    if not isinstance(data, dict):
+        return []
+    out: list[dict] = []
+    services = data.get("servicos") or data.get("services") or []
+    for item in services:
+        if not isinstance(item, dict):
+            continue
+        if item.get("vivo") is False or item.get("alive") is False:
+            nome = str(item.get("nome") or item.get("name") or "?")
+            out.append({"sensor": "manifest-check", "key": f"service:{nome}",
+                        "fix": f"manifest-check: servico declarado fora do ar ({nome}) — subir ou corrigir manifesto"})
+    legacy = data.get("down", data.get("dead", [])) or []
+    if isinstance(legacy, dict):
+        legacy = list(legacy.values())
+    for item in legacy:
+        nome = str(item.get("name") or item.get("nome") or item.get("port") or item)[:60]
+        out.append({"sensor": "manifest-check", "key": f"service:{nome}",
+                    "fix": f"manifest-check: servico declarado fora do ar ({nome}) — subir ou corrigir manifesto"})
+    for nome in data.get("scripts_ausentes") or []:
+        nome = str(nome)[:60]
+        out.append({"sensor": "manifest-check", "key": f"script-ausente:{nome}",
+                    "fix": f"manifest-check: script declarado ausente ({nome}) — instalar do source canonico ou remover do manifesto"})
+    for nome in data.get("scripts_nao_executaveis") or []:
+        nome = str(nome)[:60]
+        out.append({"sensor": "manifest-check", "key": f"script-sem-execucao:{nome}",
+                    "fix": f"manifest-check: script declarado sem execucao ({nome}) — corrigir permissao ou manifesto"})
+    return out
+
+
 def findings() -> list[dict]:
     out: list[dict] = []
     # 1) estado orfao (arquivos em ~/.local/state que ninguem le)
@@ -58,16 +94,12 @@ def findings() -> list[dict]:
                             "fix": f"state-audit: arquivo orfao {name} — conferir se pode ser quarentenado (manifest)"})
         except Exception:
             pass
-    # 2) servico declarado mas morto
+    # 2) capacidade declarada mas ausente/morta: servico ou script
     rc, s = run([str(BIN / "manifest-check"), "--json"])
     if s:
         try:
             d = json.loads(s)
-            items = d.get("down", d.get("dead", [])) if isinstance(d, dict) else []
-            for x in items[:8]:
-                key = str(x.get("name") or x.get("port") or x)[:60]
-                out.append({"sensor": "manifest-check", "key": key,
-                            "fix": f"manifest-check: servico declarado fora do ar ({key}) — subir ou corrigir manifesto"})
+            out.extend(manifest_findings(d)[:8])
         except Exception:
             pass
     # 3) jobs quebrados/atrasados
