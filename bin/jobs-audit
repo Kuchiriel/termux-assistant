@@ -105,16 +105,16 @@ RASTROS = {
     "battery-monitor": ["job-battery-monitor.trace", "battery.csv"],
     "battery-monitor-job": ["job-battery-monitor.trace", "battery.csv"],
     "wake-monitor": ["job-wake-monitor.trace", "wake-monitor-last.json"],
-    "publish-inventory": ["inventory/termux.json"],   # relativo ao repo
+    "publish-inventory": ["repo:inventory/termux.json"],
     "host-check": ["job-host-check.trace", "host-check.log"],
     "backup": ["job-backup.trace", "backup.log"],
     "mesh-sync": ["job-mesh-sync.trace", "mesh-sync.log"],
     "mesh-apply": ["job-mesh-sync.trace", "mesh-sync.log"],
     "pendencia-job": ["job-pendencia.trace"],
     "pendencia": ["job-pendencia.trace"],
-    "fleet-retry": ["job-fleet-retry.trace", "fleet-retry/retry.log"],
-    "route-watch": ["job-route-watch.trace", "route-watch/route-watch.log"],
-    "backlog-nudge": ["job-backlog-nudge.trace", "backlog-nudge/"],
+    "fleet-retry": ["state:job-fleet-retry.trace", "state:fleet-retry/retry.log"],
+    "route-watch": ["state:job-route-watch.trace", "state:route-watch/route-watch.log"],
+    "backlog-nudge": ["state:job-backlog-nudge.trace", "state:backlog-nudge/"],
     "entropy-watch-job": ["job-entropy-watch.trace", "entropy-watch-job.out"],
     "fleet-dispatch": ["job-fleet-dispatch.trace", "fleet-dispatch.log"],
 }
@@ -123,12 +123,17 @@ RASTROS = {
 def ultimo_rastro(nome):
     """(mtime, caminho) do rastro mais recente do job, ou (None, None)."""
     melhor = (None, None)
+    state = os.path.join(HOME, ".local/state")
     for cand in RASTROS.get(nome, []):
-        if "/" in cand:
-            p = os.path.join(os.environ.get("AI_MESH_DIR", os.path.join(HOME, "ai-mesh")), cand)
+        # Prefixo explicito: '/' sozinho nao indica o repo — logs do scheduler
+        # tambem podem ter subdiretorios dentro de ~/.local/state.
+        if cand.startswith("repo:"):
+            p = os.path.join(os.environ.get("AI_MESH_DIR", os.path.join(HOME, "ai-mesh")), cand[5:])
+        elif cand.startswith("state:"):
+            p = os.path.join(state, cand[6:])
         else:
-            p = os.path.join(HOME, ".local/state", cand)
-        if not os.path.isfile(p):
+            p = os.path.join(state, cand)
+        if not os.path.exists(p):
             continue
         mt = os.path.getmtime(p)
         if melhor[0] is None or mt > melhor[0]:
