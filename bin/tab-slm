@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/data/data/com.termux/files/usr/bin/bash
 # tab-slm — one-shot: carrega modelo, responde, SAi (sem servidor, sem RAM presa).
 set -uo pipefail
 for f in "$HOME/.config/termux-assistant/.env"; do [ -r "$f" ] && { set -a; . "$f"; set +a; }; done
