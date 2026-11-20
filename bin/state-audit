@@ -17,12 +17,17 @@ POR QUE (medido 13/11 no celular):
     (por basename), com tamanho e data da ultima escrita. Nao apaga NADA: a
     limpeza e' do dono. So mostra o que pode enganar.
 
+    Decisoes anteriores de manutencao tambem sao respeitadas: os manifests
+    `~/docs/quarentena-state-orfaos-*.json` podem declarar arquivos mantidos, com
+    motivo. Esses arquivos aparecem como MANTIDOS, nao como orfaos.
+
 Como funciona: varre ~/bin, ~/hooks e ~/.config/opencode (incluindo as skills),
 junta os basenames citados e marca o que nao aparece em nenhum deles. Um arquivo
 citado pelo PROPRIO nome (ex.: 'bus-host.tsv' dentro de um script) conta como
-referenciado.
+referenciado; sidecars ativos reconhecidos tambem sao classificados.
 """
 import argparse
+import glob
 import json
 import os
 import re
@@ -33,6 +38,13 @@ HOME = os.path.expanduser("~")
 STATE = os.path.join(HOME, ".local/state")
 FONTES = [os.path.join(HOME, "bin"), os.path.join(HOME, "hooks"),
           os.path.join(HOME, ".config/opencode")]
+MANIFEST_DIR = os.path.join(HOME, "docs")
+MANIFEST_GLOB = "quarentena-state-orfaos-*.json"
+# Sidecars ativos cujo nome e' derivado por codigo, portanto nao aparece
+# literalmente nas fontes. Nao sao orfaos.
+GENERATED_SIDECARS = {
+    "ta-state.cache.meta": "sidecar do cache ta-state (ativo)",
+}
 
 
 def texto_dos_fontes():
@@ -74,6 +86,83 @@ def texto_dos_fontes():
     return "\n".join(partes)
 
 
+def mantidos_por_manifesto():
+    """Lê decisões anteriores de manutenção sem tratar tudo como órfão.
+
+    Um manifesto `quarentena-state-orfaos-*.json` pode listar em `mantidos`
+    arquivos vivos, com motivo. Reaparece-los como órfão apenas porque o nome
+    é construído dinamicamente no código (marcadores do plugin, sidecars de
+    cache, traces de jobs) engana a busca literal.
+    """
+    conhecidos = {}
+    pattern = os.path.join(MANIFEST_DIR, MANIFEST_GLOB)
+    for path in sorted(glob.glob(pattern)):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            continue
+        for item in data.get("mantidos") or []:
+            if not isinstance(item, dict):
+                continue
+            nome = item.get("arquivo")
+            if not nome:
+                continue
+            conhecidos[str(nome)] = {
+                "motivo": str(item.get("motivo") or "mantido por manifesto"),
+                "manifesto": os.path.basename(path),
+            }
+    for nome, motivo in GENERATED_SIDECARS.items():
+        base = nome[:-5] if nome.endswith(".meta") else ""
+        if base and os.path.isfile(os.path.join(STATE, base)):
+            conhecidos[nome] = {"motivo": motivo, "manifesto": "gerado-ativo"}
+    return conhecidos
+
+
+def auditor():
+    if not os.path.isdir(STATE):
+        return {"arquivos": 0, "orfaos": 0, "lista": [], "mantidos": 0, "lista_mantidos": []}
+    citada = texto_dos_fontes()
+    conhecidos = mantidos_por_manifesto()
+    orfaos = []
+    mantidos = []
+    total = 0
+    for nome in sorted(os.listdir(STATE)):
+        p = os.path.join(STATE, nome)
+        if not os.path.isfile(p):
+            continue
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        total += 1
+        base = {
+            "arquivo": nome,
+            "bytes": st.st_size,
+            "ultima_escrita": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
+            "idade_dias": round((time.time() - st.st_mtime) / 86400, 1),
+        }
+        if nome in conhecidos:
+            item = dict(base)
+            item.update(conhecidos[nome])
+            mantidos.append(item)
+            continue
+        # citado pelo basename (ou por um pedaco do nome sem extensao)
+        alvo = nome
+        if len(alvo) > 4 and alvo.endswith((".log", ".tsv", ".json", ".csv", ".txt")):
+            alvo = alvo.rsplit(".", 1)[0]
+        if alvo and alvo in citada:
+            continue
+        orfaos.append(base)
+    return {
+        "arquivos": total,
+        "orfaos": len(orfaos),
+        "lista": orfaos,
+        "mantidos": len(mantidos),
+        "lista_mantidos": mantidos,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--json", action="store_true")
@@ -86,42 +175,23 @@ def main():
     if not os.path.isdir(STATE):
         print("sem ~/.local/state")
         return 0
-    citada = texto_dos_fontes()
-    orfaos = []
-    total = 0
-    for nome in sorted(os.listdir(STATE)):
-        p = os.path.join(STATE, nome)
-        if not os.path.isfile(p):
-            continue
-        try:
-            st = os.stat(p)
-        except OSError:
-            continue
-        total += 1
-        # citado pelo basename (ou por um pedaco do nome sem extensao)
-        alvo = nome
-        if len(alvo) > 4 and alvo.endswith((".log", ".tsv", ".json", ".csv", ".txt")):
-            alvo = alvo.rsplit(".", 1)[0]
-        if alvo and alvo in citada:
-            continue
-        orfaos.append({
-            "arquivo": nome,
-            "bytes": st.st_size,
-            "ultima_escrita": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
-            "idade_dias": round((time.time() - st.st_mtime) / 86400, 1),
-        })
-
+    report = auditor()
     if a.json:
-        print(json.dumps({"arquivos": total, "orfaos": len(orfaos), "lista": orfaos},
-                         ensure_ascii=False, indent=1))
+        print(json.dumps(report, ensure_ascii=False, indent=1))
         return 0
 
-    print("arquivos em ~/.local/state: %d | ORFAOS (nenhum script os cita): %d" % (total, len(orfaos)))
+    print("arquivos em ~/.local/state: %d | ORFAOS (nenhum script os cita): %d | MANTIDOS por manifesto: %d" %
+          (report["arquivos"], report["orfaos"], report["mantidos"]))
     print()
     print("%-34s %10s %-18s %s" % ("arquivo", "bytes", "ultima escrita", "idade (dias)"))
-    for o in sorted(orfaos, key=lambda x: -x["bytes"]):
+    for o in sorted(report["lista"], key=lambda x: -x["bytes"]):
         print("%-34s %10d %-18s %s" % (o["arquivo"], o["bytes"], o["ultima_escrita"], o["idade_dias"]))
-    if orfaos:
+    if report["lista_mantidos"]:
+        print()
+        print("MANTIDOS por manifesto (nao sao orfaos):")
+        for item in sorted(report["lista_mantidos"], key=lambda x: x["arquivo"]):
+            print("  %-32s %s" % (item["arquivo"], item["motivo"]))
+    if report["lista"]:
         print()
         print("Um orfao nao e' inofensivo: parece fonte (tem data e registro) e mente em")
         print("silencio. Este auditor NAO apaga nada — a limpeza e' do dono.")
