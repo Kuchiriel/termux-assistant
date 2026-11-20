@@ -4,6 +4,16 @@
 set -uo pipefail
 export PATH="$HOME/bin:$PATH"
 S="$HOME/.local/state/backlog-nudge"; mkdir -p "$S"
+TRACE="$HOME/.local/state/job-backlog-nudge.trace"
+# Rastro INCONDICIONAL: o diretorio de flags so muda quando ha algo para
+# cobrar. Sem este trace, o auditor nao distingue "rodou sem achado" de
+# "nao rodou" e acusa atraso falso.
+printf '%s start\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$TRACE"
+_finish() {
+  rc=$?
+  printf '%s rc=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$rc" >> "$TRACE"
+}
+trap _finish EXIT
 B="$HOME/bin/backlog"
 [ -x "$B" ] || B="$HOME/projects/termux-assistant/bin/backlog"
 python3 - "$B" "$S" <<'PY'
