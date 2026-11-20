@@ -1,0 +1,62 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# entropy-watch-job - executor seguro do sensor→fila para o Termux:API.
+#
+#   entropy-watch-job
+#   entropy-watch-job --help
+#
+# O job roda a cada 30 min. Este wrapper aplica:
+#   - flock nao-bloqueante: duas execucoes nunca disputam a mesma fila;
+#   - timeout: um sensor lento nao segura o job indefinidamente;
+#   - trace local: jobs-audit consegue medir a ultima execucao;
+#   - log local da saida, sem bus e sem segredo.
+#
+# Nao apaga nada, nao reinicia servico e nao mexe em pasta pessoal.
+set -uo pipefail
+
+usage() {
+  cat <<'EOF'
+Uso: entropy-watch-job [--help]
+
+Executa ~/bin/entropy-watch sob lock e timeout, deixando rastro em
+~/.local/state/job-entropy-watch.trace.
+
+Variaveis de ambiente para teste:
+  ENTROPY_WATCH_BIN  binario entropy-watch a executar
+  ENTROPY_STATE_DIR  diretorio de estado/lock/trace
+  ENTROPY_TIMEOUT    timeout em segundos (padrao 300)
+EOF
+}
+
+case "${1:-}" in
+  --help|-h) usage; exit 0 ;;
+  "") : ;;
+  *) echo "entropy-watch-job: opcao desconhecida: $1" >&2; usage >&2; exit 2 ;;
+esac
+
+STATE_DIR="${ENTROPY_STATE_DIR:-$HOME/.local/state}"
+WATCH_BIN="${ENTROPY_WATCH_BIN:-$HOME/bin/entropy-watch}"
+TIMEOUT_SECONDS="${ENTROPY_TIMEOUT:-300}"
+LOCK="$STATE_DIR/entropy-watch-job.lock"
+TRACE="$STATE_DIR/job-entropy-watch.trace"
+OUT="$STATE_DIR/entropy-watch-job.out"
+
+mkdir -p "$STATE_DIR"
+
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  printf '%s lock-busy\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$TRACE"
+  echo "entropy-watch-job: execucao concorrente ignorada"
+  exit 0
+fi
+
+if [ ! -x "$WATCH_BIN" ]; then
+  printf '%s rc=127 missing=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$WATCH_BIN" >> "$TRACE"
+  echo "entropy-watch-job: binario ausente: $WATCH_BIN" >&2
+  exit 127
+fi
+
+timeout "$TIMEOUT_SECONDS" "$WATCH_BIN" > "$OUT" 2>&1
+rc=$?
+printf '%s rc=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$rc" >> "$TRACE"
+tail -n 20 "$OUT"
+exit "$rc"

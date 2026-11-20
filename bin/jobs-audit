@@ -112,6 +112,10 @@ RASTROS = {
     "mesh-apply": ["job-mesh-sync.trace", "mesh-sync.log"],
     "pendencia-job": ["job-pendencia.trace"],
     "pendencia": ["job-pendencia.trace"],
+    "fleet-retry": ["job-fleet-retry.trace", "fleet-retry/retry.log"],
+    "route-watch": ["job-route-watch.trace", "route-watch/route-watch.log"],
+    "backlog-nudge": ["job-backlog-nudge.trace", "backlog-nudge/"],
+    "entropy-watch-job": ["job-entropy-watch.trace", "entropy-watch-job.out"],
     "fleet-dispatch": ["job-fleet-dispatch.trace", "fleet-dispatch.log"],
 }
 
@@ -150,6 +154,9 @@ def check_scripts_bin():
         return quebrados
     for nome in nomes:
         if nome.endswith(".pyc"):
+            continue
+        # backups do instalador nao sao scripts de job (shebang do repo)
+        if ".ta-backup-" in nome:
             continue
         p = os.path.join(HOME, "bin", nome)
         if not os.path.isfile(p):
