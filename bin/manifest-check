@@ -3,7 +3,7 @@
 
     manifest-check                # tabela: declarado x vivo
     manifest-check --json         # saida em JSON
-    manifest-check --check        # sai 1 se algum servico declarado nao estiver no ar
+    manifest-check --check        # sai 1 se algum servico/script declarado faltar
     manifest-check --help
 
 POR QUE (medido 12/11 no celular):
@@ -18,9 +18,12 @@ POR QUE (medido 12/11 no celular):
     - porta TCP aceitando conexao (para host local: 127.0.0.1; para a tailnet:
       o IP do proprio host);
     - e, para quem responde HTTP, um GET em /health.
+    - todo script declarado no manifesto: arquivo presente e executavel em
+      ~/bin (o contrato vira medicao, nao apenas declaracao).
 
-    So LE: nao sobe, nao para e nao altera nada. O que ele faz e' impedir que o
-    repo volte a afirmar uma capacidade que nao existe.
+    So LE: nao sobe, nao para, nao executa o script declarado e nao altera nada.
+    O que ele faz e' impedir que o repo volte a afirmar uma capacidade que nao
+    existe.
 """
 import argparse
 import json
@@ -31,6 +34,7 @@ import sys
 HOME = os.path.expanduser("~")
 MESH = os.environ.get("AI_MESH_DIR", os.path.join(HOME, "ai-mesh"))
 MANIFEST = os.path.join(MESH, "manifests/termux.json")
+BIN_DIR = os.environ.get("TERMUX_BIN_DIR", os.path.join(HOME, "bin"))
 
 
 def porta_aberta(host, porta, timeout=3):
@@ -60,23 +64,57 @@ def http_vivo(host, porta, timeout=4):
         return True, "tcp ok (sem /health)"
 
 
-def main():
+def check_scripts(script_names, bin_dir=BIN_DIR):
+    """Confere se cada capacidade de script declarada existe e executa."""
+    rows = []
+    ausentes = []
+    nao_executaveis = []
+    for nome in sorted(set(str(n) for n in (script_names or []) if n)):
+        path = os.path.join(bin_dir, nome)
+        existe = os.path.isfile(path)
+        executavel = existe and os.access(path, os.X_OK)
+        if not existe:
+            detalhe = "ausente"
+            ausentes.append(nome)
+        elif not executavel:
+            detalhe = "presente, sem permissao de execucao"
+            nao_executaveis.append(nome)
+        else:
+            detalhe = "OK"
+        rows.append({
+            "nome": nome,
+            "path": path,
+            "existe": existe,
+            "executavel": executavel,
+            "detalhe": detalhe,
+        })
+    return {
+        "declarados": len(rows),
+        "ausentes": ausentes,
+        "nao_executaveis": nao_executaveis,
+        "scripts": rows,
+    }
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--help", "-h", action="store_true")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if a.help:
         print(__doc__)
         return 0
 
     try:
-        d = json.load(open(MANIFEST))
+        with open(MANIFEST, encoding="utf-8") as fh:
+            d = json.load(fh)
     except Exception as e:
         print("nao consegui ler o manifesto %s: %s" % (MANIFEST, e), file=sys.stderr)
         return 2
 
     svcs = d.get("servicos") or d.get("services") or []
+    script_contract = check_scripts(d.get("scripts") or [], bin_dir=BIN_DIR)
     ip_tail = d.get("tailnet_ip") or ""
     rows = []
     fora = 0
@@ -106,7 +144,11 @@ def main():
     if a.json:
         print(json.dumps({"ts": __import__("datetime").datetime.now().isoformat(),
                           "manifesto": MANIFEST,
-                          "declarados": len(rows), "fora_do_ar": fora, "servicos": rows},
+                          "declarados": len(rows), "fora_do_ar": fora, "servicos": rows,
+                          "scripts_declarados": script_contract["declarados"],
+                          "scripts_ausentes": script_contract["ausentes"],
+                          "scripts_nao_executaveis": script_contract["nao_executaveis"],
+                          "scripts": script_contract["scripts"]},
                          ensure_ascii=False, indent=1))
     else:
         print("%-18s %-22s %s" % ("servico", "declarado", "medido"))
@@ -118,8 +160,19 @@ def main():
         if fora:
             print("ATENCAO: o manifesto declara capacidades que NAO estao no ar — "
                   "ou o servico caiu, ou o manifesto esta errado.")
+        print()
+        sc = script_contract
+        print("scripts declarados: %d | ausentes: %d | sem execucao: %d"
+              % (sc["declarados"], len(sc["ausentes"]), len(sc["nao_executaveis"])))
+        for nome in sc["ausentes"]:
+            print("  AUSENTE: %s (%s)" % (nome, os.path.join(BIN_DIR, nome)))
+        for nome in sc["nao_executaveis"]:
+            print("  SEM EXECUCAO: %s (%s)" % (nome, os.path.join(BIN_DIR, nome)))
+        if not sc["ausentes"] and not sc["nao_executaveis"]:
+            print("  todo script declarado existe e e' executavel.")
     if a.check:
-        return 1 if fora else 0
+        return 1 if (fora or script_contract["ausentes"] or
+                     script_contract["nao_executaveis"]) else 0
     return 0
 
 
