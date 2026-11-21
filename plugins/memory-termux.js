@@ -31,7 +31,7 @@
 //   MEMORY_TERMUX_DEBUG=1 (escreve dump em ~/.local/state/memory-termux-debug.json)
 
 import { execFileSync } from "node:child_process";
-import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, appendFileSync } from "node:fs";
 
 const HOME = process.env.HOME || "${HOME}";
 const STATE_CMD = process.env.TA_STATE_CMD || `${HOME}/bin/ta-state`;
@@ -45,6 +45,15 @@ let stateCache = { at: 0, text: "" };      // cache global do processo
 const debugSeen = new Set();
 const sessionState = new Map();             // sessionID -> { at, len }
 let identityCache = { at: 0, text: "" };    // fallback se o evento nao trouxer model
+
+// (20/11) rastro do idle: distingue "hook nao disparou" de "fila vazia" e
+// "budade bloqueado". Nao e segredo: so eventos, tarefa curta e decisao.
+function traceIdle(data) {
+  try {
+    appendFileSync(`${HOME}/.local/state/auto-wake-idle.jsonl`,
+      JSON.stringify({ ts: new Date().toISOString(), ...data }) + "\n");
+  } catch {}
+}
 
 function debug(label, data) {
   if (!DEBUG) return;
@@ -539,10 +548,24 @@ export default {
             nightSid = readFileSync(`${HOME}/.local/state/night-session`, "utf8").trim();
           } catch {}
           if (nightSid && nightSid === sid) return;
-          const budget = runCmd([`${HOME}/bin/auto-wake`, "budget"], 12000);
-          if (!String(budget || "").includes("OK")) return;
-          const task = String(runCmd([`${HOME}/bin/auto-wake`, "next"], 12000) || "").trim();
+          traceIdle({ event: "idle", sid: sid.slice(0, 40) });
+          // (20/11) olhar a fila ANTES do budget: gastar o orcamento em idle
+          // com fila vazia pode deixar a frota travada quando a tarefa chega.
+          let task = String(runCmd([`${HOME}/bin/auto-wake`, "peek"], 12000) || "").trim();
+          traceIdle({ event: "peek", found: !!task });
+          if (!task) {
+            runCmd([`${HOME}/bin/auto-improve`, "--once"], 60000);
+            task = String(runCmd([`${HOME}/bin/auto-wake`, "peek"], 12000) || "").trim();
+            traceIdle({ event: "refill", found: !!task });
+          }
           if (!task) return;
+          const budget = runCmd([`${HOME}/bin/auto-wake`, "budget"], 12000);
+          const allowed = String(budget || "").includes("OK");
+          traceIdle({ event: "budget", allowed });
+          if (!allowed) return;
+          task = String(runCmd([`${HOME}/bin/auto-wake`, "next"], 12000) || "").trim();
+          if (!task) return;
+          traceIdle({ event: "wake", task: task.slice(0, 100) });
           // Injetar /goal <tarefa> para o loop nativo do /goal continuar sozinho.
           // O objetivo e mantido no servidor (sobrevive a compactacao) e so para quando
           // o juiz diz "done"/"blocked" ou 50 rodadas / 3 stall s.
@@ -555,10 +578,16 @@ export default {
             "Regras: meca antes de agir; nada de 'deve funcionar'; nao apague nada (use phone-fs propose",
             "para mover); nao reinicie o opencode; segredos fora do bus/repo; se precisar de acao do dono,",
             "registre no bus e siga com o resto.",
-            "Ao terminar: escreva 1 linha de status e ENFILEIRE a proxima tarefa com",
+            "Ao concluir com sucesso, marque ESTA tarefa como concluida:",
+            "auto-wake complete \"<a mesma tarefa>\" --reason \"<evidencia>\".",
+            "Se ela continuar pendente, devolva com auto-wake requeue \"<a mesma tarefa>\" --reason \"<motivo>\".",
+            "Depois escreva 1 linha de status e ENFILEIRE a proxima tarefa com",
             "auto-wake enqueue (ou pare se nao houver mais nada util).",
           ].join("\n");
           await ctx.session.synthetic({ sessionID: sid, text: goalText });
+          // (20/11) precisão por wake: snapshot idempotente em JSONL, alimenta
+          // o gate que só amplia MAX_REMOTE com 10 wakes e precisão >=0,8.
+          runCmd([`${HOME}/bin/auto-improve`, "--snapshot"], 60000);
           mark("auto-wake", { sessionID: sid, task: task.slice(0, 120) });
         } catch (e) {
           debug("auto-wake-fail", { err: String(e) });
