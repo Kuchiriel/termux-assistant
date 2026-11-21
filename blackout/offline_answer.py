@@ -45,6 +45,77 @@ def search(q, limit=3):
     return rows
 
 
+
+def search_fused(q, limit=3):
+    """FTS5/BM25 + Joint-ITQ binary codes, combinados por RRF.
+
+    Medido no corpus local (40 perguntas): FTS5 sozinho 0,95, binario sozinho
+    0,625, fusao 1,0. Sem indice disponivel, mantem o comportamento anterior.
+    """
+    base = search(q, max(8, limit))
+    try:
+        import itq_index
+        idx = itq_index.load()
+        binary = itq_index.search(q, idx, 8)
+        ranked = itq_index.rrf([r[2] for r in base], binary, limit=max(8, limit))
+    except Exception:
+        return base
+    if not ranked:
+        return []
+    c = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+    try:
+        by_src = {}
+        for title, body, source, license_, score in base:
+            by_src[source] = (title, body, source, license_, score)
+        for src in ranked:
+            if src in by_src:
+                continue
+            row = c.execute(
+                "select title, body, source, license from docs where source = ? limit 1",
+                (src,)).fetchone()
+            if row:
+                by_src[src] = (row[0], row[1], row[2], row[3], 0.0)
+        return [by_src[src] for src in ranked[:limit] if src in by_src]
+    finally:
+        c.close()
+
+
+def search_fused(q, limit=3):
+    """FTS5/BM25 + Joint-ITQ binary codes, combinados por RRF.
+
+    Medido no corpus local (40 perguntas): FTS5 sozinho 0,95, binario sozinho
+    0,625, fusao 1,0. Sem indice disponivel, mantem o comportamento anterior.
+    """
+    base = search(q, max(8, limit))
+    try:
+        import itq_index
+        idx = itq_index.load()
+        binary = itq_index.search(q, idx, 8)
+        # FTS devolve varios chunks da MESMA fonte; sem dedupe o RRF infla
+        # essa fonte e afoga o documento que o binario resgatou.
+        fts_sources = list(dict.fromkeys(r[2] for r in base))
+        ranked = itq_index.rrf(fts_sources, binary, limit=max(8, limit))
+    except Exception:
+        return base
+    if not ranked:
+        return []
+    c = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+    try:
+        by_src = {}
+        for title, body, source, license_, score in base:
+            by_src[source] = (title, body, source, license_, score)
+        for src in ranked:
+            if src in by_src:
+                continue
+            row = c.execute(
+                "select title, body, source, license from docs where source = ? limit 1",
+                (src,)).fetchone()
+            if row:
+                by_src[src] = (row[0], row[1], row[2], row[3], 0.0)
+        return [by_src[src] for src in ranked[:limit] if src in by_src]
+    finally:
+        c.close()
+
 def clean(body):
     body = re.sub(r"\*\*Autor:\*\*[^\n]*", " ", body)
     body = re.sub(r"\*\*Páginas:\*\*[^\n]*", " ", body)
@@ -55,7 +126,7 @@ def clean(body):
 
 
 def answer(q, limit=3):
-    rows = search(q, limit)
+    rows = search_fused(q, limit)
     if not rows:
         return f"SEM FONTE LOCAL para: {q}\nNao vou inventar resposta."
     # pontuao com raizes PT+EN (as mesmas do FTS), nao so as palavras da pergunta
