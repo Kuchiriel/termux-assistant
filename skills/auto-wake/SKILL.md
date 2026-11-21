@@ -37,6 +37,8 @@ export default {
 ~/bin/auto-wake list               # lista tarefas ativas
 ~/bin/auto-wake archive "id" --reason "evidencia"  # arquiva 1 tarefa resolvida
 ~/bin/auto-wake archived           # mostra o historico append-only
+~/bin/auto-wake claimed            # mostra tarefas retiradas para execucao
+~/bin/auto-wake requeue "id" --reason "motivo"  # devolve 1 tarefa claimed
 ~/bin/auto-wake next               # interno (o plugin usa)
 ```
 
@@ -47,6 +49,8 @@ Regras implementadas:
   duplicata exata é idempotente;
 - tarefa resolvida sai da fila por `archive`, mas o texto integral + evidência ficam
   em `~/.local/state/auto-queue.resolved.jsonl` (append-only; não apaga histórico);
+- `next` registra a tarefa como claimed antes de retirá-la; se o agente travar,
+  `requeue <única> --reason` devolve a tarefa sem perder o histórico;
 - orçamento: **máx. 12 wakes/hora** + gap mínimo de 3 min;
 - **não** mexe na sessão da noite (`Turno da noite - TAB`, que tem ciclo próprio);
 - o prompt admite as regras: medir antes de agir, não apagar nada, não reiniciar o opencode,
