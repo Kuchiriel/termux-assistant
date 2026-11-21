@@ -1,180 +1,19 @@
-#!/data/data/com.termux/files/usr/bin/python3
-"""manifest-check - confere o manifesto da frota contra o DISCO.
+#!/data/data/com.termux/files/usr/bin/bash
+# manifest-check — shim do Termux para o contrato canonico da malha.
+#
+# A logica vive em ai-mesh/shared/scripts/manifest-check. O Termux usa este
+# shim porque o repo compartilhado precisa rodar tambem no Linux, enquanto o
+# runtime do celular usa interpretadores absolutos do Termux.
+#
+#   manifest-check
+#   manifest-check --json
+#   manifest-check --check
+#   manifest-check --parity
+set -uo pipefail
 
-    manifest-check                # tabela: declarado x vivo
-    manifest-check --json         # saida em JSON
-    manifest-check --check        # sai 1 se algum servico/script declarado faltar
-    manifest-check --help
-
-POR QUE (medido 12/11 no celular):
-    MEDIDO: o manifesto do celular declarava 'openai-bridge:8788' como servico,
-    mas a ponte estava MORTA desde o reboot (faltava token no env) — e nada
-    denunciava isso, porque manifesto e' uma DECLARACAO, nao uma medicao. Todo
-    mundo lia o manifesto e acreditava numa capacidade inexistente. Pior: o
-    heartbeat JA/mediava a porta (e reclamava ha 23 h), mas ninguem cruzava as
-    duas informacoes.
-
-    Este verificador cruza o que a frota DECLARA com o que esta NO AR:
-    - porta TCP aceitando conexao (para host local: 127.0.0.1; para a tailnet:
-      o IP do proprio host);
-    - e, para quem responde HTTP, um GET em /health.
-    - todo script declarado no manifesto: arquivo presente e executavel em
-      ~/bin (o contrato vira medicao, nao apenas declaracao).
-
-    So LE: nao sobe, nao para, nao executa o script declarado e nao altera nada.
-    O que ele faz e' impedir que o repo volte a afirmar uma capacidade que nao
-    existe.
-"""
-import argparse
-import json
-import os
-import socket
-import sys
-
-HOME = os.path.expanduser("~")
-MESH = os.environ.get("AI_MESH_DIR", os.path.join(HOME, "ai-mesh"))
-MANIFEST = os.path.join(MESH, "manifests/termux.json")
-BIN_DIR = os.environ.get("TERMUX_BIN_DIR", os.path.join(HOME, "bin"))
-
-
-def porta_aberta(host, porta, timeout=3):
-    try:
-        with socket.create_connection((host, porta), timeout=timeout):
-            return True
-    except Exception:
-        return False
-
-
-def http_vivo(host, porta, timeout=4):
-    try:
-        with socket.create_connection((host, porta), timeout=timeout):
-            pass
-    except Exception:
-        return False
-    # tenta um GET leve em /health; se o servico nao for HTTP, a porta aberta
-    # ja conta como vivo
-    import urllib.request
-    try:
-        req = urllib.request.Request("http://%s:%d/health" % (host, porta), method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return True, "http %d" % r.status
-    except urllib.error.HTTPError as e:
-        return True, "http %d" % e.code
-    except Exception:
-        return True, "tcp ok (sem /health)"
-
-
-def check_scripts(script_names, bin_dir=BIN_DIR):
-    """Confere se cada capacidade de script declarada existe e executa."""
-    rows = []
-    ausentes = []
-    nao_executaveis = []
-    for nome in sorted(set(str(n) for n in (script_names or []) if n)):
-        path = os.path.join(bin_dir, nome)
-        existe = os.path.isfile(path)
-        executavel = existe and os.access(path, os.X_OK)
-        if not existe:
-            detalhe = "ausente"
-            ausentes.append(nome)
-        elif not executavel:
-            detalhe = "presente, sem permissao de execucao"
-            nao_executaveis.append(nome)
-        else:
-            detalhe = "OK"
-        rows.append({
-            "nome": nome,
-            "path": path,
-            "existe": existe,
-            "executavel": executavel,
-            "detalhe": detalhe,
-        })
-    return {
-        "declarados": len(rows),
-        "ausentes": ausentes,
-        "nao_executaveis": nao_executaveis,
-        "scripts": rows,
-    }
-
-
-def main(argv=None):
-    ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument("--json", action="store_true")
-    ap.add_argument("--check", action="store_true")
-    ap.add_argument("--help", "-h", action="store_true")
-    a = ap.parse_args(argv)
-    if a.help:
-        print(__doc__)
-        return 0
-
-    try:
-        with open(MANIFEST, encoding="utf-8") as fh:
-            d = json.load(fh)
-    except Exception as e:
-        print("nao consegui ler o manifesto %s: %s" % (MANIFEST, e), file=sys.stderr)
-        return 2
-
-    svcs = d.get("servicos") or d.get("services") or []
-    script_contract = check_scripts(d.get("scripts") or [], bin_dir=BIN_DIR)
-    ip_tail = d.get("tailnet_ip") or ""
-    rows = []
-    fora = 0
-    for s in svcs:
-        nome = s.get("nome") or "?"
-        host = s.get("host") or "127.0.0.1"
-        porta = int(s.get("porta") or s.get("port") or 0)
-        # servico declarado em 127.0.0.1 mas que escuta na tailnet (o opencode
-        # do Linux e' assim): se o host local nao responder, tenta o IP da
-        # tailnet do proprio host antes de dar por morto.
-        candidatos = [host]
-        if host in ("127.0.0.1", "localhost") and ip_tail:
-            candidatos.append(ip_tail)
-        vivo = False
-        detalhe = ""
-        for c in candidatos:
-            if porta_aberta(c, porta):
-                vivo = True
-                _, detalhe = http_vivo(c, porta)
-                detalhe = "%s:%d %s" % (c, porta, detalhe)
-                break
-        if not vivo:
-            fora += 1
-            detalhe = "%s:%d NAO RESPONDE" % (host, porta)
-        rows.append({"nome": nome, "host": host, "porta": porta, "vivo": vivo, "detalhe": detalhe})
-
-    if a.json:
-        print(json.dumps({"ts": __import__("datetime").datetime.now().isoformat(),
-                          "manifesto": MANIFEST,
-                          "declarados": len(rows), "fora_do_ar": fora, "servicos": rows,
-                          "scripts_declarados": script_contract["declarados"],
-                          "scripts_ausentes": script_contract["ausentes"],
-                          "scripts_nao_executaveis": script_contract["nao_executaveis"],
-                          "scripts": script_contract["scripts"]},
-                         ensure_ascii=False, indent=1))
-    else:
-        print("%-18s %-22s %s" % ("servico", "declarado", "medido"))
-        for r in rows:
-            print("%-18s %-22s %s" % (r["nome"], "%s:%d" % (r["host"], r["porta"]),
-                                      "OK  " + r["detalhe"] if r["vivo"] else "FORA " + r["detalhe"]))
-        print()
-        print("servicos declarados: %d | fora do ar: %d" % (len(rows), fora))
-        if fora:
-            print("ATENCAO: o manifesto declara capacidades que NAO estao no ar — "
-                  "ou o servico caiu, ou o manifesto esta errado.")
-        print()
-        sc = script_contract
-        print("scripts declarados: %d | ausentes: %d | sem execucao: %d"
-              % (sc["declarados"], len(sc["ausentes"]), len(sc["nao_executaveis"])))
-        for nome in sc["ausentes"]:
-            print("  AUSENTE: %s (%s)" % (nome, os.path.join(BIN_DIR, nome)))
-        for nome in sc["nao_executaveis"]:
-            print("  SEM EXECUCAO: %s (%s)" % (nome, os.path.join(BIN_DIR, nome)))
-        if not sc["ausentes"] and not sc["nao_executaveis"]:
-            print("  todo script declarado existe e e' executavel.")
-    if a.check:
-        return 1 if (fora or script_contract["ausentes"] or
-                     script_contract["nao_executaveis"]) else 0
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+CANON="${AI_MESH_DIR:-$HOME/ai-mesh}/shared/scripts/manifest-check"
+if [ ! -f "$CANON" ]; then
+  echo "manifest-check: canonical ausente: $CANON" >&2
+  exit 2
+fi
+exec /data/data/com.termux/files/usr/bin/python3 "$CANON" "$@"
