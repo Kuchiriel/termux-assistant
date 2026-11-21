@@ -34,6 +34,9 @@ export default {
 ~/bin/auto-wake enqueue "tarefa"   # enfileira (FIFO, respeita o teto)
 ~/bin/auto-wake status             # fila + teto + orçamento de wakes
 ~/bin/auto-wake queue-limit        # mostra o teto da fila
+~/bin/auto-wake list               # lista tarefas ativas
+~/bin/auto-wake archive "id" --reason "evidencia"  # arquiva 1 tarefa resolvida
+~/bin/auto-wake archived           # mostra o historico append-only
 ~/bin/auto-wake next               # interno (o plugin usa)
 ```
 
@@ -42,6 +45,8 @@ Regras implementadas:
 - só acorda se houver **tarefa na fila** (fila vazia = sessão fica ociosa de verdade);
 - fila: **teto central de 12** (`AUTO_WAKE_MAX_QUEUE`); tarefa nova no teto falha com rc=1,
   duplicata exata é idempotente;
+- tarefa resolvida sai da fila por `archive`, mas o texto integral + evidência ficam
+  em `~/.local/state/auto-queue.resolved.jsonl` (append-only; não apaga histórico);
 - orçamento: **máx. 12 wakes/hora** + gap mínimo de 3 min;
 - **não** mexe na sessão da noite (`Turno da noite - TAB`, que tem ciclo próprio);
 - o prompt admite as regras: medir antes de agir, não apagar nada, não reiniciar o opencode,
