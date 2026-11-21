@@ -32,7 +32,8 @@ export default {
 
 ```bash
 ~/bin/auto-wake enqueue "tarefa"   # enfileira (FIFO, respeita o teto)
-~/bin/auto-wake status             # fila + teto + orçamento de wakes
+~/bin/auto-wake status             # fila + teto + orçamento + ciclo de vida
+~/bin/auto-wake status --json      # contagens agregadas, sem texto de tarefas
 ~/bin/auto-wake queue-limit        # mostra o teto da fila
 ~/bin/auto-wake list               # lista tarefas ativas
 ~/bin/auto-wake archive "id" --reason "evidencia"  # arquiva 1 tarefa resolvida
@@ -54,6 +55,8 @@ Regras implementadas:
   `requeue <única> --reason` devolve a tarefa sem perder o histórico;
 - depois de executar, `complete <única> --reason <evidência>` registra a conclusão
   no histórico resolvido, preservando o claim;
+- `status --json` mostra contagens de active/claimed/resolved/requeued/unresolved e budget,
+  sem incluir o texto das tarefas;
 - orçamento: **máx. 12 wakes/hora** + gap mínimo de 3 min;
 - **não** mexe na sessão da noite (`Turno da noite - TAB`, que tem ciclo próprio);
 - o prompt admite as regras: medir antes de agir, não apagar nada, não reiniciar o opencode,
