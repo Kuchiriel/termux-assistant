@@ -1,19 +1,24 @@
 #!/data/data/com.termux/files/usr/bin/python3
-"""backlog — fila unica de pendencias com estado e 'ja resolvido' (regra P0).
+"""backlog — fila única de pendências com lifecycle auditável.
 
 Uso:
-  backlog list [--open|--done]
+  backlog list [--open|--blocked|--done|--all]
   backlog add "tarefa" --owner X --host Y
-  backlog done <id> --evidence "numero/arquivo/PR"
-  backlog check            #Mostra o que esta aberto e o que ja tem evidencia
+  backlog block <id> --reason "motivo/evidência"
+  backlog requeue <id> --reason "novo motivo"
+  backlog done <id> --evidence "número/arquivo/PR"
+  backlog check            # mostra abertos e bloqueados
 
-Fonte: ~/.local/state/termux-assistant/backlog.json (append-only em eventos).
+Fonte: ~/.local/state/termux-assistant/backlog.json. Cada transição guarda um
+evento append-only em `history`; a estado atual continua em `status`.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -28,40 +33,108 @@ def load():
 
 def save(d):
     F.parent.mkdir(parents=True, exist_ok=True)
-    F.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = json.dumps(d, ensure_ascii=False, indent=2) + "\n"
+    fd, tmp = tempfile.mkstemp(prefix=F.name + ".", dir=str(F.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, F)
+    finally:
+        try:
+            if os.path.exists(tmp): os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def transition(item, status, *, reason="", evidence=None):
+    """Apply one lifecycle transition and append its audit event."""
+    previous = str(item.get("status") or "open")
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    event = {"ts": ts, "from": previous, "to": status}
+    if reason: event["reason"] = reason
+    if evidence is not None: event["evidence"] = evidence
+    item.setdefault("history", []).append(event)
+    item["status"] = status
+    if reason: item["reason"] = reason
+    if evidence is not None: item["evidence"] = evidence
+    if status == "blocked": item["blocked_at"] = ts
+    if status == "open": item["requeued_at"] = ts
+    if status == "done": item["done_at"] = ts
+
+
+def find_item(items, item_id):
+    for item in items:
+        if int(item.get("id", -1)) == int(item_id):
+            return item
+    return None
 
 
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd")
     q = sub.add_parser("add"); q.add_argument("task"); q.add_argument("--owner", default=""); q.add_argument("--host", default="")
+    q = sub.add_parser("block"); q.add_argument("id", type=int); q.add_argument("--reason", required=True)
+    q = sub.add_parser("requeue"); q.add_argument("id", type=int); q.add_argument("--reason", required=True)
     q = sub.add_parser("done"); q.add_argument("id", type=int); q.add_argument("--evidence", required=True)
-    q = sub.add_parser("list"); q.add_argument("--all", action="store_true")
+    q = sub.add_parser("list")
+    group = q.add_mutually_exclusive_group()
+    group.add_argument("--open", action="store_true")
+    group.add_argument("--blocked", action="store_true")
+    group.add_argument("--done", action="store_true")
+    q.add_argument("--all", action="store_true")
     sub.add_parser("check")
     a = p.parse_args()
     d = load(); items = d["items"]
 
     if a.cmd == "add":
         items.append({"id": len(items)+1, "task": a.task, "owner": a.owner,
-                      "host": a.host, "status": "open", "evidence": "",
-                      "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+                      "host": a.host, "status": "open", "evidence": "", "reason": "",
+                      "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                      "history": [{"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                   "from": "-", "to": "open"}]})
         save(d); print(f"#{len(items)} {a.task}")
-    elif a.cmd == "done":
-        for it in items:
-            if it["id"] == a.id:
-                it["status"] = "done"; it["evidence"] = a.evidence
-                print(f"#{a.id} done: {a.evidence[:80]}"); break
+    elif a.cmd in ("block", "requeue", "done"):
+        item = find_item(items, a.id)
+        if item is None:
+            print(f"backlog: item #{a.id} não encontrado", file=sys.stderr)
+            return 2
+        if a.cmd == "block":
+            if item.get("status") == "done":
+                print(f"backlog: item #{a.id} já está done", file=sys.stderr)
+                return 2
+            transition(item, "blocked", reason=a.reason)
+            print(f"#{a.id} blocked: {a.reason[:100]}")
+        elif a.cmd == "requeue":
+            if item.get("status") == "done":
+                print(f"backlog: item #{a.id} já está done", file=sys.stderr)
+                return 2
+            transition(item, "open", reason=a.reason)
+            print(f"#{a.id} requeued: {a.reason[:100]}")
+        else:
+            transition(item, "done", reason=item.get("reason", ""), evidence=a.evidence)
+            print(f"#{a.id} done: {a.evidence[:80]}")
         save(d)
     elif a.cmd == "check":
-        abertos = [i for i in items if i["status"] == "open"]
-        print(f"abertos={len(abertos)} total={len(items)}")
-        for i in abertos[:12]: print(f"  #{i['id']:02d} [{i['owner'] or '?'}] {i['task'][:80]}")
+        abertos = [i for i in items if i.get("status") == "open"]
+        bloqueados = [i for i in items if i.get("status") == "blocked"]
+        print(f"abertos={len(abertos)} blocked={len(bloqueados)} total={len(items)}")
+        for i in abertos[:12]: print(f"  #{i['id']:02d} [open] [{i['owner'] or '?'}] {i['task'][:80]}")
+        for i in bloqueados[:12]: print(f"  #{i['id']:02d} [blocked] [{i['owner'] or '?'}] {i['task'][:64]} :: {i.get('reason','')[:100]}")
     else:
+        wanted = None
+        if a.open: wanted = "open"
+        elif a.blocked: wanted = "blocked"
+        elif a.done: wanted = "done"
         for i in items:
-            if not a.all and i["status"] != "open": continue
-            print(f"#{i['id']:02d} [{i['status']}] {i['task'][:90]} "
-                  f"({i['owner'] or '?'}/{i['host'] or '?'}) {i['evidence'][:60]}")
+            if not a.all and wanted is not None and i.get("status") != wanted: continue
+            if not a.all and wanted is None and i.get("status") != "open": continue
+            suffix = i.get("reason") or i.get("evidence") or ""
+            print(f"#{i['id']:02d} [{i.get('status','open')}] {i['task'][:90]} "
+                  f"({i.get('owner') or '?'}/{i.get('host') or '?'}) {suffix[:100]}")
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
