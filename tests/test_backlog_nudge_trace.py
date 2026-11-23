@@ -44,6 +44,11 @@ class BacklogNudgeTraceTests(unittest.TestCase):
         self.assertTrue(lines[1].endswith(" rc=0"))
         self.assertTrue(lines[2].endswith(" start"))
         self.assertTrue(lines[3].endswith(" rc=0"))
+    def test_nudge_message_explains_delivery_and_blocked_return(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("backlog done <id> --evidence", source)
+        self.assertIn("backlog block <id> --reason", source)
+        self.assertIn("backlog requeue <id> --reason", source)
 
 
 if __name__ == "__main__":

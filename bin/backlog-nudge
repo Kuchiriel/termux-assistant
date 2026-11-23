@@ -37,7 +37,9 @@ for it in d.get('items',[]):
     flag.write_text('ok')
     msg=(f"COBRANCA P0: backlog #{it['id']} ({owner}) aberto ha "
          f"{int((now-t)/60)}min. Entregue ou devolva o item com motivo; "
-         "NAO responda 'vou ver'. Use backlog done <id> --evidence '<numero>'.")
+         "NAO responda 'vou ver'. Entregue com backlog done <id> --evidence "
+         "'<numero>'; devolva com backlog block <id> --reason '<motivo>'; "
+         "use backlog requeue <id> --reason '<motivo>' quando puder retomar.")
     post = ['/data/data/com.termux/files/usr/bin/bash','-c',
             '~/bin/bus-post "$1" --to "$2" --kind msg >/dev/null 2>&1 || true','--',msg,owner]
     subprocess.run(post, timeout=40)
