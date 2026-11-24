@@ -1,0 +1,157 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# windows-backtest-nudge — cobra o agente Windows (Tatu) se os backtests MT5
+# pararem. Roda a cada 30 min via termux-job-scheduler.
+# READ-ONLY no bus; publica SOMENTE se nao houver mensagem AUTORADA por Tatu
+# nas ultimas 2h. Nao inventa resultado nem mexe em producao.
+set -uo pipefail
+
+usage() {
+  cat <<'EOF'
+Uso: windows-backtest-nudge [--dry-run] [--json] [--help]
+
+Lê as mensagens do bus e pede ao Tatu que retome os backtests MT5 quando a
+última mensagem realmente autorada por ele estiver antiga.
+
+  --dry-run  mede e mostra a decisão, sem publicar no bus
+  --json     imprime a decisão em JSON
+  --help     mostra esta ajuda
+
+Variáveis de teste/operacao: BUS_ISSUE, GH_BIN, BUS_POST_BIN,
+NUDGE_AFTER_MIN, NOW_EPOCH.
+EOF
+}
+
+DRY_RUN=0
+JSON=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --json) JSON=1 ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "windows-backtest-nudge: opcao desconhecida: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+BUS="${BUS_ISSUE:-100}"
+GH_BIN="${GH_BIN:-gh}"
+BUS_POST_BIN="${BUS_POST_BIN:-$HOME/bin/bus-post}"
+AFTER_MIN="${NUDGE_AFTER_MIN:-120}"
+NOW="${NOW_EPOCH:-$(date +%s)}"
+if ! [[ "$BUS" =~ ^[0-9]+$ ]] || ! [[ "$AFTER_MIN" =~ ^[0-9]+$ ]] || ! [[ "$NOW" =~ ^[0-9]+$ ]]; then
+  echo "windows-backtest-nudge: BUS_ISSUE, NUDGE_AFTER_MIN e NOW_EPOCH devem ser inteiros" >&2
+  exit 2
+fi
+
+STATE_DIR="$HOME/.local/state"
+STATE="$STATE_DIR/windows-backtest-nudge.json"
+TRACE="$STATE_DIR/job-windows-backtest-nudge.trace"
+mkdir -p "$STATE_DIR"
+printf '%s start\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$TRACE"
+_finish() {
+  rc=$?
+  printf '%s rc=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$rc" >> "$TRACE"
+}
+trap _finish EXIT
+
+LATEST=""
+PAGE=1
+while [ "$PAGE" -le 60 ]; do
+  RAW=$(timeout 30 "$GH_BIN" api \
+    "repos/Kuchiriel/mt5/issues/$BUS/comments?per_page=100&page=$PAGE" 2>/dev/null)
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "windows-backtest-nudge: GitHub API falhou (rc=$rc); nenhum nudge publicado" >&2
+    exit 1
+  fi
+  PARSED=$(python3 -c '
+import json, re, sys
+try:
+    rows = json.load(sys.stdin)
+except Exception as exc:
+    print("ERROR\t" + type(exc).__name__)
+    raise SystemExit(0)
+if not isinstance(rows, list):
+    print("ERROR\tnot_a_list")
+    raise SystemExit(0)
+latest = ""
+for row in rows:
+    body = str(row.get("body") or "")
+    if not re.match(r"^\*\*[^*]+\*\* de `Tatu` ", body):
+        continue
+    created = str(row.get("created_at") or "")
+    if created > latest:
+        latest = created
+print(str(len(rows)) + "\t" + latest)
+' <<< "$RAW")
+  COUNT="${PARSED%%$'\t'*}"
+  PAGE_LATEST="${PARSED#*$'\t'}"
+  if [ "$COUNT" = "ERROR" ] || ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
+    echo "windows-backtest-nudge: resposta invalida do GitHub API; nenhum nudge publicado" >&2
+    exit 1
+  fi
+  if [ "$PAGE_LATEST" != "-" ] && [ "$PAGE_LATEST" != "" ]; then
+    if [ -z "$LATEST" ] || [[ "$PAGE_LATEST" > "$LATEST" ]]; then
+      LATEST="$PAGE_LATEST"
+    fi
+  fi
+  [ "$COUNT" -lt 100 ] && break
+  PAGE=$((PAGE + 1))
+done
+
+if [ -z "$LATEST" ]; then
+  echo "windows-backtest-nudge: nenhuma mensagem autorada por Tatu; nenhum nudge publicado" >&2
+  exit 0
+fi
+
+TS=$(date -u -d "$LATEST" +%s 2>/dev/null || true)
+if ! [[ "$TS" =~ ^[0-9]+$ ]]; then
+  echo "windows-backtest-nudge: timestamp invalido: $LATEST; nenhum nudge publicado" >&2
+  exit 1
+fi
+LAST=0
+if [ -f "$STATE" ]; then
+  LAST=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("last_seen",0)))' "$STATE" 2>/dev/null || echo 0)
+fi
+if [ "$TS" -gt "$LAST" ]; then
+  python3 - "$STATE" "$TS" "$NOW" <<'PY'
+import json, os, sys, tempfile
+path, ts, now = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+directory = os.path.dirname(path)
+fd, tmp = tempfile.mkstemp(prefix="windows-backtest-nudge.", suffix=".tmp", dir=directory)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    json.dump({"last_seen": ts, "updated": now}, fh)
+    fh.write("\n")
+    fh.flush()
+    os.fsync(fh.fileno())
+os.replace(tmp, path)
+PY
+  LAST="$TS"
+fi
+if [ "$NOW" -lt "$LAST" ]; then
+  AGE=0
+else
+  AGE=$(( (NOW - LAST) / 60 ))
+fi
+
+if [ "$AGE" -lt "$AFTER_MIN" ]; then
+  ACTION="no_nudge"
+elif [ "$DRY_RUN" -eq 1 ]; then
+  ACTION="would_nudge"
+else
+  MESSAGE="nudge backtests MT5: faz $((AGE/60))h que nao vejo mensagem de Tatu (windows/badiel). Se os backtests da bateria Mesa de 6 candidatos estao parados, retome e poste results no bus; se o shell do harness do Windows estiver fora, poste O ERRO EXATO e o estado dos commits/push dos docs 93/96/103. Nao mexer no EA de producao."
+  if timeout 60 "$BUS_POST_BIN" "$MESSAGE" --to Tatu --kind msg >/dev/null 2>&1; then
+    ACTION="nudge_posted"
+  else
+    echo "windows-backtest-nudge: falha ao publicar no bus" >&2
+    exit 1
+  fi
+fi
+
+if [ "$JSON" -eq 1 ]; then
+  printf '{"latest_tatu":"%s","age_min":%s,"threshold_min":%s,"action":"%s"}\n' \
+    "$LATEST" "$AGE" "$AFTER_MIN" "$ACTION"
+else
+  printf 'latest_tatu=%s age_min=%s threshold_min=%s action=%s\n' \
+    "$LATEST" "$AGE" "$AFTER_MIN" "$ACTION"
+fi
