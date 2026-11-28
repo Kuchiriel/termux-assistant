@@ -89,8 +89,38 @@ except Exception:
 
 meu=""; modelo=""; provider=""; variant=""; sessao_id="$SID"; versao=""
 
+# cache de identidade por sessao (MEDIDO 28/11: a sondagem via CLI do opencode
+# custa ~4,6s no celular; uma chamada gh custa 0,63s — a identidade era ~90% do
+# custo de CADA chamada da malha (bus-post, agent-codename, heartbeat...).
+# TTL curtinho (default 60s) porque o dono peut trocar de modelo na sessao;
+# OC_IDENTIDADE_CACHE_TTL=0 desliga. So quando a sessao e' CONHECIDA.
+ID_CACHE="$HOME/.local/state/oc-identidade-cache.json"
+ID_TTL="${OC_IDENTIDADE_CACHE_TTL:-60}"
+cache_hit=""
+if [[ -n "$SID" && "$OFFLINE" != "1" && "$ID_TTL" != "0" ]]; then
+  cache_hit=$(python3 - "$ID_CACHE" "$SID" "$ID_TTL" <<'PY' 2>/dev/null
+import json,sys,time
+path,sid,ttl=sys.argv[1],sys.argv[2],float(sys.argv[3])
+try:
+    e=json.load(open(path)).get(sid)
+    if e and time.time()-float(e.get("ts",0))<ttl:
+        print(json.dumps(e))
+except Exception:
+    pass
+PY
+)
+  if [[ -n "$cache_hit" ]]; then
+    meu=$(python3 -c "import json,sys;print(json.loads(sys.argv[1]).get('server',''))" "$cache_hit")
+    modelo=$(python3 -c "import json,sys;print(json.loads(sys.argv[1]).get('model',''))" "$cache_hit")
+    provider=$(python3 -c "import json,sys;print(json.loads(sys.argv[1]).get('provider',''))" "$cache_hit")
+    variant=$(python3 -c "import json,sys;print(json.loads(sys.argv[1]).get('variant',''))" "$cache_hit")
+  fi
+fi
+
 # caminho 1: o servico gerenciado desta CLI (sem --server) - é o mais simples
-if [[ -n "$SID" ]]; then
+# MEDIDO 28/11: precisava da guarda `-z "$meu"` tambem — sem ela o cache-hit
+# ainda pagava a chamada da CLI (~4,5s no celular).
+if [[ -z "$meu" && -n "$SID" ]]; then
   s=$(timeout "$TIMEOUT" opencode api GET "/api/session/$SID" 2>/dev/null)
   if printf '%s' "$s" | grep -q "\"id\":\"$SID\""; then
     meu="servico-gerenciado"
@@ -129,11 +159,32 @@ except Exception: pass" 2>/dev/null)
   fi
 fi
 
-if [[ -n "$meu" ]]; then
+# MEDIDO 28/11: no cache-hit `meu` ja vem preenchido e este bloco ainda
+# chamava a CLI (/api/health) — o hit custava o mesmo que o miss. Com
+# `-z "$modelo"` o hit nao gera NENHUMA chamada de CLI.
+if [[ -n "$meu" && -z "$modelo" ]]; then
   modelo=$(printf '%s' "$s" | campo id)
   provider=$(printf '%s' "$s" | campo providerID)
   variant=$(printf '%s' "$s" | campo variant)
   versao=$(timeout "$TIMEOUT" opencode api GET "/api/health" --server "$meu" 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+fi
+
+# grava o cache por sessao (so com identidade resolvida de fato)
+if [[ -n "$SID" && -n "$modelo" && "$OFFLINE" != "1" && "$ID_TTL" != "0" ]]; then
+  python3 - "$ID_CACHE" "$SID" "$meu" "$modelo" "$provider" "$variant" <<'PY' 2>/dev/null
+import json,sys,time,os
+path,sid,server,model,prov,var=sys.argv[1:7]
+try:
+    d={}
+    if os.path.exists(path):
+        d=json.load(open(path))
+    d[sid]={"ts":time.time(),"server":server,"model":model,"provider":prov,"variant":var}
+    tmp=path+".tmp"
+    json.dump(d,open(tmp,"w"))
+    os.replace(tmp,path)
+except Exception:
+    pass
+PY
 fi
 
 if [[ "$JSON" == "1" ]]; then
