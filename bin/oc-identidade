@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/usr/bin/env bash
 # oc-identidade - descobre dinamicamente qual OpenCode roda a sessao atual e
 # qual o MODELO desta sessao. Nada fixo: o modelo muda entre as sessoes.
 #
@@ -58,7 +58,8 @@ except Exception:
     print(json.dumps({"session":sid,"server":"offline","version":"","model":"","provider":"","variant":""}))
 ')
   if [[ "$JSON" == "1" ]]; then printf '%s\n' "$out"; exit 0; fi
-  python3 -c "import json,sys;d=json.loads(sys.argv[1]);print('\033[1mTAB\033[0m - identidade (offline)\n  sessao    : %s\n  MODELO    : %s/%s (%s)' % (d['session'] or 'desconhecida', d['provider'] or '?', d['model'] or '?', d['variant'] or '-'))" "$out"
+  CN_OFF=$(AGENT_ID_JSON="$out" "$HOME/bin/agent-codename" 2>/dev/null || echo '')
+  python3 -c "import json,sys;d=json.loads(sys.argv[1]);print('\033[1m%s\033[0m - identidade (offline)\n  sessao    : %s\n  MODELO    : %s/%s (%s)' % (sys.argv[2] or 'agente-sem-codinome', d['session'] or 'desconhecida', d['provider'] or '?', d['model'] or '?', d['variant'] or '-'))" "$out" "${CN_OFF:-agente-sem-codinome}"
   exit 0
 fi
 
@@ -136,17 +137,27 @@ if [[ -n "$meu" ]]; then
 fi
 
 if [[ "$JSON" == "1" ]]; then
-  printf '{"session":"%s","server":"%s","version":"%s","model":"%s","provider":"%s","variant":"%s"}\n' \
-    "$sessao_id" "$meu" "$versao" "$modelo" "$provider" "$variant"
+  ID_JSON=$(printf '{"session":"%s","server":"%s","version":"%s","model":"%s","provider":"%s","variant":"%s"}' \
+    "$sessao_id" "$meu" "$versao" "$modelo" "$provider" "$variant")
+  CN=$(AGENT_ID_JSON="$ID_JSON" "$HOME/bin/agent-codename" 2>/dev/null || echo '')
+  printf '{"session":"%s","server":"%s","version":"%s","model":"%s","provider":"%s","variant":"%s","codename":"%s"}\n' \
+    "$sessao_id" "$meu" "$versao" "$modelo" "$provider" "$variant" "$CN"
   exit 0
 fi
 
-printf '\033[1mTAB\033[0m - identidade dinamica\n'
+CN_DISP=$(AGENT_ID_JSON="$(printf '{"session":"%s","server":"%s","version":"%s","model":"%s","provider":"%s","variant":"%s"}' \
+  "$sessao_id" "$meu" "$versao" "$modelo" "$provider" "$variant")" \
+  "$HOME/bin/agent-codename" 2>/dev/null || echo '')
+printf '\033[1m%s\033[0m - identidade dinamica\n' "${CN_DISP:-agente-sem-codinome}"
 printf '  sessao    : %s\n' "${sessao_id:-desconhecida}"
 printf '  meu server: %s%s\n' "${meu:-nao achei}" "${versao:+ (v$versao)}"
 printf '  MODELO    : %s\n' "${modelo:-?}"
 printf '  provider  : %s\n' "${provider:-?}"
 printf '  variante  : %s\n' "${variant:-?}"
+CN=$(AGENT_ID_JSON="$(printf '{"session":"%s","server":"%s","version":"%s","model":"%s","provider":"%s","variant":"%s"}' \
+  "$sessao_id" "$meu" "$versao" "$modelo" "$provider" "$variant")" \
+  "$HOME/bin/agent-codename" 2>/dev/null || echo '')
 echo ""
-echo "  nome de apresentacao: TAB (fixo)"
+echo "  identidade da sessao (agent): ${CN:-?}"
 echo "  MODELO: dinamico por sessao - NAO fixar no AGENTS.md, use este script."
+echo "  identidade inclui LLM real + id da sessao + objetivo/escopo/capacidades."
